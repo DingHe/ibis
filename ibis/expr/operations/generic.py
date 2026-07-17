@@ -156,12 +156,21 @@ class Literal(Scalar[T]):
 
 NULL = Literal(None, dt.null)
 
-
+# ScalarParameter 是 Ibis 中代表标量参数（Scalar Parameter）的操作节点类。
+# 在编写 SQL 或进行数据查询时，我们经常需要编写“占位符”，等真正执行查询时再动态传入具体的值。例如在 SQL 中写的 :val 或 %s。
+# ScalarParameter 就扮演了这个“占位符”的角色：
+# 未绑定的占位符：它允许你在不知道具体数值的情况下，先定义一个具有特定数据类型（如 int64、string）的参数节点，并用它参与复杂的表达式构建（例如 table.filter(table.age > ibis.param(dt.int64))）。
+# 唯一标识性：为了防止多个参数在编译时混淆，每一个 ScalarParameter 节点在被创建时都会分配一个全局唯一的计数器编号，从而自动生成形如 param_0、param_1 这样唯一的参数名称。
+# 延迟赋值编译：在最终把 Ibis 表达式编译为 SQL（如 Postgres、DuckDB SQL）时，它会被翻译为对应后端的参数占位符，并在 .execute(params={...}) 时将真实的值安全地注入进去（防止 SQL 注入）。
 @public
 class ScalarParameter(Scalar):
+    # 全局的、线程安全的自动递增计数器（利用了 Python 标准库中的 itertools.count）
+    # 是类属性（Class Attribute），所有 ScalarParameter 的实例都会共享同一个计数器。每当有新的参数节点被创建且没有手动指定 counter 时，
+    # 它就会调用 next(self._counter) 产生一个新的整数（$0, 1, 2, \dots$），以此确保每一个参数节点的唯一性。
     _counter = itertools.count()
-
+    # 声明参数的 Ibis 数据类型（Data Type）
     dtype: dt.DataType
+    # 存储当前参数实例的唯一标识序号
     counter: Optional[int] = None
 
     shape = ds.scalar

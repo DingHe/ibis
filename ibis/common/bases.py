@@ -109,11 +109,20 @@ class AbstractMeta(type):
         # 子类可以通过重写 __create__ 来灵活决定是返回一个新实例，还是从缓存中捞出一个已有实例（避免重复创建相同 AST 节点），或者根据传入参数的类型动态返回一个完全不同子类的实例，而不用受到 __init__ 强制初始化的羁绊。
         return cls.__create__(*args, **kwargs)
 
-
+# Abstract 是 Python Ibis 核心对象体系（如表达式节点、操作节点等）的直接基类（Base Class）。它联合 AbstractMeta 一起，为整个 Ibis 框架奠定了最底层的实例化行为和内存规范。
+# 核心作用有两个：
+# 作为统一的基类入口，应用 AbstractMeta 的元类行为：
+# 在 Python 中，元类是不会自动隐式继承的。通过让 Abstract 显式指定 metaclass=AbstractMeta，所有继承自 Abstract 的 Ibis 核心子类，都会自动继承并应用 AbstractMeta 带来的特性：
+# 为整个类层级定义默认的内存与实例化契约：
+# 它显式定义了子类在未重写实例化逻辑时的“默认行为”，并小心翼翼地为 Python 的底层垃圾回收/弱引用机制留出了通道。
 class Abstract(metaclass=AbstractMeta):
     """Base class for many of the ibis core classes, see `AbstractMeta`."""
-
+    # 在开启 __slots__ 的紧凑内存模式下，允许该类的实例被弱引用（Weak Reference）。
+    # Abstract 显式声明 __slots__ = ("__weakref__",)。
+    # 这相当于告诉 Python：“我们依然不需要肥胖的 __dict__ 属性字典，但请为我们保留一个微小的弱引用指针通道。” 这样既享受了 Slots 带来的内存暴降与速度提升，又保留了弱引用功能。
     __slots__ = ("__weakref__",)
+    # 定义子类默认的实例化工厂方法
+    # 它把内置的 type.__call__ 包装成一个类方法（classmethod）赋值给 __create__。
     __create__ = classmethod(type.__call__)  # type: ignore
 
 
@@ -132,16 +141,27 @@ class Immutable(Abstract):
             f"type {type(self)}"
         )
 
-
+# 虽然这个类名叫 Singleton（单例），但它实现的并不是传统意义上“一个类只能有一个实例”的狭义单例，而是一种基于实例化参数的享元模式（Flyweight Pattern）或对象池缓存。
+# 核心作用是：根据传入的参数缓存类实例。
+# 在 Ibis 框架中，如果用户多次使用相同的参数创建同一个表达式或操作节点，Singleton 可以确保只在内存中创建一次该对象，后续的调用会直接返回已经存在的同一个对象。
+# 内存与性能极致优化：避免在复杂的 SQL 构建过程中，重复创建数万个内容完全相同的 AST（抽象语法树）节点。
+# 极速的对象比对（$O(1)$ 复杂度）：因为相同的参数对应的是内存中同一个对象，当 Ibis 比较两个节点是否相等时，可以直接比较它们的内存地址（使用 is 运算符），这比递归对比它们内部的所有属性要快上成百上千倍。
 class Singleton(Abstract):
     """Cache instances of the class based on instantiation arguments."""
-
+    # 作为全局的对象缓存池，存放已经创建好的实例
+    # 这是一个弱引用值字典（Weak Value Dictionary）。它与普通的 Python 字典 dict 最大的区别在于：它对值（Value，也就是缓存的实例对象）的引用是弱引用。
+    # 自动垃圾回收（GC）：如果一个实例在外部没有任何强引用了（比如用户已经不再使用这个 Ibis 表达式了），Python 的垃圾回收器会正常将其回收。
+    # 一旦被回收，WeakValueDictionary 会自动把该实例对应的键值对从字典中移除，不需要人工去清理缓存。
     __instances__: Mapping[Any, Self] = WeakValueDictionary()
-
+    # cls：当前正在实例化的具体子类。
+    # *args：传入的 positional 参数。
+    # **kwargs：传入的 keyword 参数。
     @classmethod
     def __create__(cls, *args, **kwargs) -> Self:
+        # 当前类本身 cls、所有的位置参数 args（本身就是元组）、以及关键字参数 kwargs（转换成只读的元组形式）组合在一起，形成了一个可哈希（Hashable）的元组 key。这个 key 唯一标识了“用这组特定参数创建该类的请求”。
         key = (cls, args, tuple(kwargs.items()))
         try:
+            # 尝试从缓存中提取已有的实例：
             return cls.__instances__[key]
         except KeyError:
             instance = super().__create__(*args, **kwargs)
