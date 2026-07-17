@@ -56,7 +56,12 @@ if TYPE_CHECKING:
     import pyarrow as pa
     import pyarrow.dataset as ds
 
-
+## api.py 在 Ibis 架构中扮演着 “API 门面（Facade）” 的角色。
+## 统一的命名空间入口：它将分散在 Ibis 源码各处（如 datatypes、operations、types、schema、sql 等子模块）的类型、表达式定义、内置函数统一导入，
+## 并组织在全局的 __all__ 元组中。当用户运行 import ibis 时，实际上访问的大部分核心函数都源自于该文件。
+## 表达式和类型构建：提供了快速构建 Ibis AST（抽象语法树）节点的便捷函数，如定义未绑定表（Unbound Table）、内存表（Memtable）、参数化变量（Param）以及各类时间、日期和间隔对象。
+## 多后端支持的衔接：暴露了数据连接（connect）、后端获取（get_backend）等跨后端数据源的操作。
+## __all__ 是模块中定义的一个特殊列表变量,用来控制 from module import * 时,哪些名字会被导入。
 __all__ = (
     "Column",
     "DataType",
@@ -138,19 +143,26 @@ __all__ = (
 
 V = TypeVar("V", bound=ir.Value)
 
-
+# 类型工厂函数。用于快速将 Python 类型、字符串或 Type 对象转换为 Ibis 的 DataType 对象（例如将 'int64' 转为 Int64 类型）。
 dtype = dt.dtype
+# 数据类型推导器。传入一个 Python 原生数据或结构（如 1、[1.2, 3.4]），自动推导出对应的 Ibis 数据类型。
 infer_dtype = dt.infer
+# 表结构推导器。传入类似 Pandas DataFrame、PyArrow Table 等内存数据集，自动生成对应的 Ibis Schema。
 infer_schema = sch.infer
+# 聚合函数引用。暴露 Table 对象的聚合（agg）方法。
 aggregate = ir.Table.aggregate
+# 笛卡尔积关联。暴露 Table 对象的交叉连接方法。
 cross_join = ir.Table.cross_join
+# 关系关联（JOIN）。暴露 Table 对象的基本 Join（如 Inner, Left Join）方法。
 join = ir.Table.join
+# Asof 关联。通常用于时序数据，匹配最接近的时间点。
 asof_join = ir.Table.asof_join
-
+# 数学常数 $e$。返回一个代表自然常数 $e$ 的 Ibis 标量表达式。
 e = ops.E().to_expr()
+# 圆周率常数 $\pi$。返回一个代表圆周率 $\pi$ 的 Ibis 标量表达式。
 pi = ops.Pi().to_expr()
 
-
+#延迟执行代号。也就是常用的 _（下划线）。它用于链式操作中代表“前一步处理完的表或表达式本身”，从而避免显式声明中间变量。
 deferred = _
 """Deferred expression object.
 
@@ -180,7 +192,15 @@ ibis.Schema {
 }
 """
 
-
+# Python 3.8 引入的语法
+# 一个函数签名里可以同时包含仨种参数,用 / 和 * 分隔:
+# def f(pos_only, /, normal, *, kw_only):
+#     pass
+# pos_only:在 / 之前 → 只能位置传参
+# normal:在 / 和 * 之间 → 位置或关键字都行
+# kw_only:在 * 之后 → 只能关键字传参
+# 创建一个未绑定的参数化标量（Scalar Parameter）
+# 这允许在构建复杂的计算图（Ibis Expression）时预留一个“占位符”，而无需提供实际的数据。在最后阶段调用 .execute(params={...}) 时，再动态传入该参数的具体值。常用于构建通用的、可复用的过滤或计算逻辑。
 def param(type: dt.DataType, /) -> ir.Scalar:
     """Create a deferred parameter of a given type.
 
@@ -215,7 +235,7 @@ def param(type: dt.DataType, /) -> ir.Scalar:
     """
     return ops.ScalarParameter(type).to_expr()
 
-
+# 验证并生成一个 Ibis Schema（表结构描述元数据） 对象
 def schema(
     pairs: IntoSchema | None = None,
     /,
@@ -267,7 +287,10 @@ def schema(
 
 _table_names = (f"unbound_table_{i:d}" for i in itertools.count())
 
-
+# 创建一个未绑定实际数据的抽象表表达式（UnboundTable）
+# 在未连接任何实体数据库（如 PostgreSQL 或 BigQuery）的情况下，根据指定的 schema 虚拟出一张表。
+# 可以为表定义 name，如果不指定，则会使用内部迭代器 _table_names 自动生成 unbound_table_0、unbound_table_1 这样的名称。
+# 支持定义其在层级数据库中的命名空间，即属于哪个 catalog（目录）和 database（数据库）。
 def table(
     schema: IntoSchema | None = None,
     name: str | None = None,
@@ -335,7 +358,7 @@ def table(
         namespace=ops.Namespace(catalog=catalog, database=database),
     ).to_expr()
 
-
+# 将内存中的数据集（In-memory data）转换为 Ibis Table 表达式
 def memtable(
     data: IntoMemtable,
     /,
@@ -459,7 +482,7 @@ Supported types include:
 - `geopandas.GeoDataFrame`
 """
 
-
+# memtable 的底层私有分发处理核心（使用 @lazy_singledispatch 实现）。根据传入的 data 类型，分流给不同的具体转换逻辑
 @lazy_singledispatch
 def _memtable(
     data: Any,
@@ -487,7 +510,8 @@ def _memtable(
         )
     return _memtable(data, columns=columns, schema=schema)
 
-
+# 对 Pandas DataFrame 进行处理。
+# 清洗不合规的列名（转为 string）、检查是否有重复列名（Ibis 不允许重复列），然后使用 PandasDataFrameProxy 代理生成 InMemoryTable 操作。
 @_memtable.register("pandas.DataFrame")
 def _memtable_from_pandas_dataframe(
     data: pd.DataFrame,
@@ -531,7 +555,7 @@ def _memtable_from_pandas_dataframe(
     )
     return op.to_expr()
 
-
+# 包装 PyArrow 内存表，使用 PyArrowTableProxy 构建。
 @_memtable.register("pyarrow.Table")
 def _memtable_from_pyarrow_table(
     data: pa.Table,
@@ -550,7 +574,7 @@ def _memtable_from_pyarrow_table(
         data=PyArrowTableProxy(data),
     ).to_expr()
 
-
+# 包装 PyArrow 存储数据集。
 @_memtable.register("pyarrow.dataset.Dataset")
 def _memtable_from_pyarrow_dataset(
     data: ds.Dataset,
@@ -566,7 +590,7 @@ def _memtable_from_pyarrow_dataset(
         data=PyArrowDatasetProxy(data),
     ).to_expr()
 
-
+# 如果传入该类型会直接抛出 TypeError，因为该操作会隐式强制将全部流数据读入内存，Ibis 强制要求用户先手动执行 .read_all() 以保证内存安全。
 @_memtable.register("pyarrow.RecordBatchReader")
 def _memtable_from_pyarrow_RecordBatchReader(
     data: pa.Table,
@@ -580,12 +604,12 @@ def _memtable_from_pyarrow_RecordBatchReader(
         "explicitly like `ibis.memtable(reader.read_all())`"
     )
 
-
+# 对 Polars 惰性帧执行 .collect() 收集后转化为普通 DataFrame 再做处理。
 @_memtable.register("polars.LazyFrame")
 def _memtable_from_polars_lazyframe(data: pl.LazyFrame, **kwargs):
     return _memtable_from_polars_dataframe(data.collect(), **kwargs)
 
-
+# 包装 Polars 内存表
 @_memtable.register("polars.DataFrame")
 def _memtable_from_polars_dataframe(
     data: pl.DataFrame,
@@ -604,7 +628,7 @@ def _memtable_from_polars_dataframe(
         data=PolarsDataFrameProxy(data),
     ).to_expr()
 
-
+# 包装地理空间地理帧。为了兼容后端（如 DuckDB），它在转化前会把 Geometry 列转换为 WKB（Well-Known Binary）二进制大对象，再调用 _memtable。
 @_memtable.register("geopandas.geodataframe.GeoDataFrame")
 def _memtable_from_geopandas_geodataframe(
     data: gpd.GeoDataFrame,
@@ -620,7 +644,8 @@ def _memtable_from_geopandas_geodataframe(
 
     return _memtable(wkb_df, schema=schema, columns=columns)
 
-
+# 用于在 Ibis 全局函数中支持“延迟计算（Deferred）”的链式调用。它可以解析传入的 expr。
+# 如果是字符串，会变成对延迟对象相应列的调用（如 _[expr]）；如果是延迟对象或可调用对象，则继续传递，从而实现像 ibis.desc("my_column") 这种极为灵活的延迟表达。
 def _deferred_method_call(
     expr: str | Deferred | Callable | Any, method_name: str, **kwargs
 ):
@@ -635,7 +660,8 @@ def _deferred_method_call(
         value = expr
     return method(value)
 
-
+# 创建一个降序排序键（Descending Sort Key）表达式。
+# 包裹一个列名字符串、一个 Value 表达式、或一个延迟对象。通过调用底层的 _deferred_method_call，生成降序排序规则。通过 nulls_first 参数控制是否将空值（NULL）排在最前。
 def desc(expr: V | str | Deferred, /, *, nulls_first: bool = False) -> V | Deferred:
     """Create a descending sort key from `expr` or column name.
 
@@ -717,15 +743,15 @@ def asc(expr: V | str | Deferred, /, *, nulls_first: bool = False) -> V | Deferr
     """
     return _deferred_method_call(expr, "asc", nulls_first=nulls_first)
 
-
+# 定义窗口函数（Window Function）的向前边界（Preceding Boundary）
 def preceding(value: V, /) -> V:
     return ops.WindowBoundary(value, preceding=True).to_expr()
 
-
+# 定义窗口函数的向后边界（Following Boundary）
 def following(value: V, /) -> V:
     return ops.WindowBoundary(value, preceding=False).to_expr()
 
-
+# 使用逻辑 与（AND） 组合多个布尔谓词表达式
 def and_(*predicates: ir.BooleanValue | bool) -> ir.BooleanValue | bool:
     """Combine multiple predicates using `&`.
 

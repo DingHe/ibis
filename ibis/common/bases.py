@@ -10,7 +10,13 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-
+# AbstractMeta 是一个非常底层且关键的元类（Metaclass）。它没有选择直接继承标准库中的 abc.ABCMeta，而是通过轻量级的自定义逻辑实现了对抽象类、内存槽（__slots__）以及自定义实例化行为的精细控制
+# 强制开启 __slots__（内存与性能优化）
+# 在 Ibis 中，表达式（Expressions）和操作（Operations）的对象实例数量非常庞大。该元类默认会为所有子类强制自动定义 __slots__ = ()。这能阻止 Python 自动为每个实例创建内部字典 __dict__，从而大幅减少内存占用并提升属性访问速度。
+# 支持轻量级抽象类（替代 abc.ABCMeta）
+# abc.ABCMeta 提供了强大的虚拟子类注册功能，但在运行时进行大量的实例检查（isinstance）开销很大。AbstractMeta 自行实现了抽象方法追踪机制（检测带有 @abstractmethod 装饰器的方法）。它不允许实例化含有未实现抽象方法的类，既保留了抽象约束，又避免了运行时的性能损耗。
+# 提供统一的自定义实例化入口（__create__）
+# 在 Python 默认的实例化流程中，__new__ 和 __init__ 的调用绑定得比较死板（只有当 __new__ 返回该类实例时才会自动调用 __init__）。AbstractMeta 将实例化行为重定向到了自定义的 __create__ 类方法上，使得 Ibis 能够自由控制表达式对象的生命周期（例如在此阶段进行缓存拦截、直接返回已有节点或进行参数预校验）。
 class AbstractMeta(type):
     """Base metaclass for many of the ibis core classes.
 
@@ -22,33 +28,60 @@ class AbstractMeta(type):
     subclasses) but avoids expensive instance checks by enforcing explicit
     subclassing.
     """
-
+    # 限制元类自身的属性存储
+    # 作为元类（Metaclass）本身，将其 __slots__ 设置为空元组 () 可以防止元类实例（即由它创建的类对象，如 Table、Expr 等）拥有 __dict__ 或 __weakref__。这保持了元类本身在内存中的极简化。
+    # 在 Python 中，你新建一个普通的类实例时，Python 会暗中为这个实例创建一个特殊的字典（__dict__）来存放它的属性。
+    # 内存浪费巨大：Python 的字典（哈希表）为了保证快速查找，内部会有大量的预留空位。一个空的字典就要占用几十到上百字节。
+    # 如果你在 Ibis 框架里生成了 100 万个 AST 节点（比如复杂的 SQL 树），光是这些“塑料袋（__dict__）”本身就会吃掉数百兆甚至上吉字节（GB）的内存！
+    # 访问速度慢（哈希查找）：当你读取 obj.x 时，Python 必须去哈希表里“计算 x 的哈希值 -> 寻找对应的槽 -> 取出值”。这虽然快，但依然需要计算和寻址。
+    # 而 AbstractMeta 元类强制让子类默认加上了 __slots__ = ()（或者子类自己指定具体的属性名，如 __slots__ = ('x', 'y')）。
+    # 内存里没有任何“塑料袋”，而是只有紧挨着的两个固定内存槽位（Slots），直接放着 x 和 y。
+    # 因为去掉了臃肿的哈希表字典，每个对象占用的内存瞬间缩水。
+    # 既然这么好，为什么 Python 不默认开启它？因为开启 __slots__ 会失去一部分动态性：
+    # 你不能再随意添加新属性了。
+    # obj = SlottedClass(1, 2)
+    # obj.z = 100  # 报错：AttributeError! 因为“收纳盒”没有给 z 留格子。
     __slots__ = ()
 
+    # 在 类对象被创建时（即 Python 解释器加载代码、定义类时） 进行拦截和构建，负责注入默认槽定义并计算该类所有的抽象方法。
+    # metacls：当前的元类本身（即 AbstractMeta）。
+    # clsname：正在创建的子类类名（字符串）
+    # bases：该子类继承的所有父类（元组）
+    # dct：子类命名空间中的属性和方法字典。
+    # **kwargs：其他传递给元类的关键字参数。
     def __new__(metacls, clsname, bases, dct, **kwargs):
         # enforce slot definitions
+        # 检查子类的属性字典。如果子类在定义时没有显式写 __slots__，元类会自动为其补上 __slots__ = ()。这确保了 Ibis 体系下所有的子类默认都不启用 __dict__。
         dct.setdefault("__slots__", ())
 
         # construct the class object
+        # 调用 type.__new__ 完成标准类对象的构建。
         cls = super().__new__(metacls, clsname, bases, dct, **kwargs)
 
         # calculate abstract methods existing in the class
+        # 计算当前类定义的抽象方法
+        # 扫描子类自身新定义或重写的方法中，哪些带有 @abstractmethod 装饰器（该装饰器会在方法上标记 __isabstractmethod__ = True），并收集起来。
         abstracts = {
             name
             for name, value in dct.items()
             if getattr(value, "__isabstractmethod__", False)
         }
+        # 遍历所有的父类，获取父类中未实现的抽象方法集合 __abstractmethods__
         for parent in bases:
             for name in getattr(parent, "__abstractmethods__", set()):
                 value = getattr(cls, name, None)
+                # 如果子类（cls）中对应的该方法依然是抽象方法（即子类没有覆盖实现它，或者子类覆盖它时依然将其标记为了抽象），则将其继续保留在当前类的 abstracts 集合中。
                 if getattr(value, "__isabstractmethod__", False):
                     abstracts.add(name)
 
         # set the abstract methods for the class
+        # 将所有计算出来的抽象方法名打包成一个不可变的 frozenset 并赋值给类的 __abstractmethods__ 属性。Python 底层在实例化类时，如果发现该属性不为空，会直接抛出 TypeError 阻止实例化。
         cls.__abstractmethods__ = frozenset(abstracts)
 
         return cls
-
+    # 控制 子类实例被创建时（即用户调用 MyClass(*args, **kwargs) 时） 的行为。
+    # cls：当前正在被调用的子类对象。
+    # *args / **kwargs：用户实例化类时传入的参数。
     def __call__(cls, *args, **kwargs):
         """Create a new instance of the class.
 
@@ -69,6 +102,11 @@ class AbstractMeta(type):
         The newly created instance of the class. No extra initialization
 
         """
+        # 在标准的 Python 元类中，__call__ 默认会先后调用类的 __new__ 和 __init__ 方法。
+        # 而在 AbstractMeta 中，这个默认行为被彻底改写：它直接调用并返回了 cls.__create__(*args, **kwargs) 的结果。
+        # 为什么这么做？
+        # 这把控制权完全交给了子类的 __create__ 类方法（Classmethod）。
+        # 子类可以通过重写 __create__ 来灵活决定是返回一个新实例，还是从缓存中捞出一个已有实例（避免重复创建相同 AST 节点），或者根据传入参数的类型动态返回一个完全不同子类的实例，而不用受到 __init__ 强制初始化的羁绊。
         return cls.__create__(*args, **kwargs)
 
 
