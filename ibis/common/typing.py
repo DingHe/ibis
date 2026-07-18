@@ -224,7 +224,9 @@ def format_typehint(typ: Any) -> str:
         # remove the module name from the typehint, including generics
         return re.sub(r"(\w+\.)+", "", str(typ))
 
-
+# 在泛型编程中，我们经常希望定义类似 class MyGeneric[T = int]: ... 的结构。PEP 696 正式支持了这种语法，但在旧版本 Python 中，泛型必须显式指定所有参数。
+# 自动补全缺失的泛型参数：如果用户定义了 MyClass[str]，但该类有多个泛型参数（例如 [T, U]），它会自动将 U 填充为预定义的默认类型。
+# 统一 API 体验：使得 Ibis 内部的复杂数据结构（如表达式节点）在使用时无需强制要求用户显式传入每一个可能的泛型参数，降低了 API 的使用门槛。
 class DefaultTypeVars:
     """Enable using default type variables in generic classes (PEP-0696)."""
 
@@ -251,7 +253,11 @@ class Sentinel(type):
 
 class CoercionError(Exception): ...
 
-
+# Coercible 是一个类型转换协议（Type Conversion Protocol）。它定义了一套标准，允许 Ibis 将用户传入的“非标准输入”自动转换为 Ibis 内部标准的数据类型或表达式节点。
+# 在构建复杂的表达式树（AST）时，用户经常会传递 Python 原生类型（如 int, str, list），而 Ibis 需要将它们“强制（Coerce）”转换为 Ibis 的对象（如 Literal, Column）。
+# 统一转换接口：强制所有支持自动转换的类实现 __coerce__ 方法。
+# 实现“智能构造”：配合 coerced_to 模式，使得 Ibis 的 API 更加友好。例如，函数参数标记为 coerced_to(dt.DataType)，传入字符串 'int64' 时，系统会自动调用 DataType.__coerce__('int64') 得到合法的类型对象。
+# 解耦类型逻辑：将“如何从原始数据构造对象”的逻辑封装在目标类型内部，而不是放在校验器或外部工厂函数中。
 class Coercible(Abstract):
     """Protocol for defining coercible types.
 
@@ -259,7 +265,9 @@ class Coercible(Abstract):
     with an instance of the type. Used in conjunction with the `coerced_to``
     pattern to coerce arguments to a specific type.
     """
-
+    # cls: 目标类型本身（例如 DataType 或 Schema）。
+    # value: Any: 待转换的原始输入（例如用户传入的 str 或 dict）。
+    # / (位置参数限制符): 强制 value 必须作为位置参数传入，确保 API 调用的规范性。
     @classmethod
     @abstractmethod
     def __coerce__(cls, value: Any, /, **kwargs: Any) -> Self: ...

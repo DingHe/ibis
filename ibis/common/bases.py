@@ -125,7 +125,8 @@ class Abstract(metaclass=AbstractMeta):
     # 它把内置的 type.__call__ 包装成一个类方法（classmethod）赋值给 __create__。
     __create__ = classmethod(type.__call__)  # type: ignore
 
-
+# Ibis 表达式树“不可变性（Immutability）”的守护者
+# Immutable 类的核心职责是强制禁止对实例属性进行任何修改。
 class Immutable(Abstract):
     """Prohibit attribute assignment on the instance."""
 
@@ -180,13 +181,23 @@ class Final(Abstract):
     def __prohibit_inheritance__(cls, **kwargs):
         raise TypeError(f"Cannot inherit from final class {cls}")
 
-
+# Hashable 类是一个桥接型基类。
+# 通过 Python 的抽象基类（ABC）机制，正式将 Ibis 的表达式节点纳入 Python 的标准哈希协议中。
+# 明确契约：强制子类通过实现 __hash__ 方法，声明该对象是“可哈希的”。
+# 类型集成：通过 @collections.abc.Hashable.register，使得 Ibis 的对象在 Python 运行时可以被 isinstance(obj, collections.abc.Hashable) 正确识别。
+# 这对于将表达式节点放入 set 或作为 dict 的 key 至关重要。
 @collections.abc.Hashable.register
 class Hashable(Abstract):
+    # ... 表示“抽象方法”或“占位符”
+    # 在 Python 的类型提示（Type Hinting）和存根文件（.pyi）中，... 的主要作用是告知解释器该方法尚未实现具体逻辑，或者该方法是一个接口声明。
     @abstractmethod
     def __hash__(self) -> int: ...
 
-
+# 编译器和查询优化过程中，Ibis 需要频繁判断两个表达式节点是否完全一致（例如判断两棵子树是否相同以进行公共表达式消除）。
+# 如果每次对比都递归遍历整棵树，开销巨大；Comparable 通过缓存计算结果，将后续相同对象的对比开销降至 $O(1)$
+# 比较结果缓存：利用全局字典 __cache__ 存储已计算过的比较结果。如果 A == B 已经计算过，下次直接返回结果，避免重复执行深层逻辑。
+# 强制实现契约：要求子类必须实现 __equals__ 方法，将“业务逻辑的相等性判断”与“框架级别的缓存机制”解耦。
+# 内存生命周期管理：在对象销毁时自动清理缓存，防止内存泄漏。
 class Comparable(Abstract):
     """Enable quick equality comparisons.
 
@@ -198,20 +209,24 @@ class Comparable(Abstract):
     Since the class holds a global cache of comparison results, it is important
     to make sure that the instances are not kept alive longer than necessary.
     """
-
+    # 类级别的全局字典，用于存储比较结果
+    # 采用嵌套字典结构，key 为对象的内存 ID（id(self)），value 为另一个字典（{other_id: bool_result}）
+    # 双向缓存，即存入 A 对 B 的结果时，同时记录 B 对 A 的结果
     __cache__ = {}
 
     @abstractmethod
     def __equals__(self, other) -> bool: ...
-
+    # 重写了 Python 的内置相等运算符（==）。这是缓存机制的入口
     def __eq__(self, other) -> bool:
+        # 如果内存地址相同，必然相等，直接返回。
         if self is other:
             return True
 
         # type comparison should be cheap
+        # 不同类型的节点永远不相等。
         if type(self) is not type(other):
             return False
-
+        # 缓存查找
         id1 = id(self)
         id2 = id(other)
         try:
@@ -221,7 +236,7 @@ class Comparable(Abstract):
             self.__cache__.setdefault(id1, {})[id2] = result
             self.__cache__.setdefault(id2, {})[id1] = result
             return result
-
+    # 显式禁止该对象被哈希化（放入 set 或作为 dict 的 key）
     __hash__ = None
 
     def __del__(self):

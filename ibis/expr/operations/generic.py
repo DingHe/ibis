@@ -20,7 +20,13 @@ from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Scalar, Unary, Value
 from ibis.expr.operations.relations import Relation  # noqa: TC001
 
-
+# 定义了 通用值操作（Generic Value Operations） 的 AST（抽象语法树）节点。
+# 这些节点被称为“通用的”，是因为它们不局限于特定数据类型（如仅针对数值、字符串或日期），而是适用于几乎所有数据类型的通用操作（例如类型转换、空值处理、条件分支、常量等）。
+# Ibis 的设计模式是 “定义与执行分离”。当你在 Ibis 中写下 expr.cast('int64') 或 ibis.coalesce(a, b) 时，Python 并不会立刻去数据库执行计算，而是构建一颗 AST。
+# generic.py 中的类就是这颗树上的具体节点类型（Operations）。它们主要用于：
+# 类型/形状推导：通过 dtype 和 shape 属性，在编译前就能推断出操作结果的数据类型（如布尔、整型）和维度（标量还是列）。
+# 输入合法性校验：利用 Python 类型的 Annotated 结合 Ibis 自带的类型模式（如 VarTuple 变长元组、Length 限制）来校验用户输入的参数。
+# 为后端翻译提供标准结构：无论底层的 SQL 后端是 DuckDB、Postgres 还是 ClickHouse，它们都会递归遍历这些标准的 Value 节点，并将其翻译成各自方言的 SQL 语句。
 @public
 class RowID(Value):
     """The row number of the returned result."""

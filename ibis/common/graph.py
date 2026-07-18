@@ -244,34 +244,44 @@ def _coerce_replacer(obj: ReplacerLike, context: Optional[dict] = None) -> Repla
 
     return fn
 
-
+# Node 类是整个表达式树（AST）系统的抽象基石。它不仅定义了节点必须具备的数据结构，还通过一套完整的图遍历框架，实现了对查询计划的分析、转换、重写与编译。
+# 结构化表达：强制所有节点通过 __args__ 和 __argnames__ 定义自身结构，使得表达式可以被程序化地拆解。
+# 图遍历协议：内置了基于拓扑排序（Topological Sort）和广度优先搜索（BFS）的算法，支持对复杂的 DAG（有向无环图）进行高效遍历。
+# 表达式重写（Rewriting）：提供了 replace 方法，这是 Ibis 实现 SQL 优化器（如常量折叠、谓词下推）的核心手段。
+# 声明式操作：通过 map 等高阶函数，允许开发者以函数式风格处理复杂的嵌套节点逻辑。
 class Node(Hashable):
     __slots__ = ()
 
+    # 工厂方法，用于根据参数重建节点实例。
+    # 在重写表达式树时，通常会通过此方法生成修改后的新节点。
     @classmethod
     def __recreate__(cls, kwargs: Any) -> Self:
         """Reconstruct the node from the given arguments."""
         return cls(**kwargs)
-
+    # 返回节点的所有子元素（依赖项）。它是遍历表达式树的入口。
     @property
     @abstractmethod
     def __args__(self) -> tuple[Any, ...]:
         """Sequence of arguments to traverse."""
-
+    # 返回对应参数的名称元组。
+    # 用于在重写节点时，将新参数映射回原始字段名。
     @property
     @abstractmethod
     def __argnames__(self) -> tuple[str, ...]:
         """Sequence of argument names."""
-
+    # 返回当前节点的直接子节点列表。通过 _flatten_collections 处理，能够自动拆解列表、元组等容器中的嵌套子节点。
     @property
     def __children__(self) -> tuple[Node, ...]:
         """Sequence of children nodes."""
         return tuple(_flatten_collections(self.__args__))
-
+    # 支持 rich 库的格式化输出。
+    # 将 argnames 与 args 压缩成键值对，极大提升了在控制台打印复杂表达式树时的可读性。
     def __rich_repr__(self):
         """Support for rich reprerentation of the node."""
         return zip(self.__argnames__, self.__args__)
-
+    # 拓扑遍历计算。
+    # 按依赖顺序从叶子到根节点应用函数 fn。
+    # 适用于需要累积中间计算结果的场景（如将表达式编译为后端特定的执行计划）。
     def map(self, fn: Callable, filter: Optional[Finder] = None) -> dict[Node, Any]:
         """Apply a function to all nodes in the graph.
 
@@ -305,7 +315,8 @@ class Node(Hashable):
             results[node] = fn(node, results, **kwargs)
 
         return results
-
+    # 内存优化版 map。
+    # 在计算过程中，一旦某个节点的子依赖不再被其他节点引用，立即删除该子节点的计算结果。极大降低了处理超大规模表达式树时的内存占用。
     @experimental
     def map_clear(self, fn: Callable, filter: Optional[Finder] = None) -> Any:
         """Apply a function to all nodes in the graph more memory efficiently.
@@ -354,7 +365,8 @@ class Node(Hashable):
                     del results[dependency]
 
         return results.get(self, self)
-
+    # 简化的 map，
+    # 仅将子节点的计算结果作为位置参数传给 fn。适用于简单的节点转换，无需显式命名参数。
     @experimental
     def map_nodes(self, fn: Callable, filter: Optional[Finder] = None) -> Any:
         """Apply a function to all nodes in the graph more memory efficiently.
@@ -371,7 +383,7 @@ class Node(Hashable):
             results[node] = fn(node, *args)
 
         return results
-
+    # 通用查找。支持类型、模式（Pattern）或回调函数匹配。返回图中所有匹配的节点列表（默认 BFS 顺序）。
     # TODO(kszucs): perhaps rename it to find_all() for better clarity
     def find(
         self,
@@ -410,7 +422,7 @@ class Node(Hashable):
         if ordered:
             graph, _ = graph.toposort()
         return [node for node in graph.nodes() if finder(node)]
-
+    # 递归向下查找，但不包含当前节点自身。
     @experimental
     def find_below(
         self,
@@ -440,7 +452,7 @@ class Node(Hashable):
         graph = Graph.from_bfs(self.__children__, filter=filter, context=context)
         finder = _coerce_finder(finder, context)
         return [node for node in graph.nodes() if finder(node)]
-
+    # “短路”查找。当发现一个匹配节点时，停止向其子树深入。常用于提取表达式中的最高层谓词或常量。
     @experimental
     def find_topmost(
         self, finder: FinderLike, context: Optional[dict] = None
@@ -475,7 +487,8 @@ class Node(Hashable):
                     queue.extend(node.__children__)
                 seen.add(node)
         return result
-
+    # 表达式树转换。
+    # 遍历整棵树，如果子节点发生变化，则触发 replacer 函数重构当前节点。它是实现 Ibis 查询优化器（Rule-based Optimization）的唯一入口，通过这种方式实现“自底向上”的递归变换。
     @experimental
     def replace(
         self,
