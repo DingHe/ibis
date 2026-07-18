@@ -27,6 +27,12 @@ from ibis.expr.operations.relations import Relation  # noqa: TC001
 # 类型/形状推导：通过 dtype 和 shape 属性，在编译前就能推断出操作结果的数据类型（如布尔、整型）和维度（标量还是列）。
 # 输入合法性校验：利用 Python 类型的 Annotated 结合 Ibis 自带的类型模式（如 VarTuple 变长元组、Length 限制）来校验用户输入的参数。
 # 为后端翻译提供标准结构：无论底层的 SQL 后端是 DuckDB、Postgres 还是 ClickHouse，它们都会递归遍历这些标准的 Value 节点，并将其翻译成各自方言的 SQL 语句。
+
+# RowID 类是一个特殊的算子节点，它用于显式地在查询中引入“行号”或“行标识符”概念。
+# RowID 的核心目的是跨数据库后端生成统一的行号引用。在许多 SQL 方言中（如 SQLite 的 rowid、PostgreSQL 的 ctid 或某些窗口函数生成的 ROW_NUMBER()），行号是一个特殊的系统列。
+# 抽象化：为用户提供一个跨后端的通用 API，无需手动编写特定 SQL 的行号获取逻辑。
+# 血缘锚定：明确该行号是属于哪张表（Relation）的属性，确保编译器在生成 SQL 时，能将行号绑定到正确的表作用域。
+# 类型固定：强制指定行号为 Int64 类型，且形状始终为 Column（每一行都有一个独立的序号）。
 @public
 class RowID(Value):
     """The row number of the returned result."""

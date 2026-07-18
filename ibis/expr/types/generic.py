@@ -37,11 +37,15 @@ if TYPE_CHECKING:
 
 _SENTINEL = object()
 
+# Value 类是所有具有明确数据类型的表达式（Expression）的基类。
+# 是 Ibis 表达式系统的核心组成部分，用于处理列（Column）、标量（Scalar）以及各种能够产生特定类型数据的中间计算结果。
+# Value 类定义了 Ibis 中所有数据的“通用操作接口”。无论底层后端是 SQL 数据库（如 PostgreSQL, DuckDB）还是内存处理框架（如 pandas, Polars），用户都可以通过这些通用方法对数据进行类型转换、空值处理、重命名、条件判断或窗口计算。它封装了底层的操作树（Operation Tree），将用户代码转化为各后端可执行的逻辑。
+# 由于 Value 是一个表达式基类，它主要通过方法来链式操作数据。
 
 @public
 class Value(Expr):
     """Base class for a data generating expression having a known type."""
-
+    # 为当前的表达式指定一个名称（别名）。在 SQL 中这相当于 AS name。
     def name(self, name: str, /) -> Self:
         """Rename an expression to `name`.
 
@@ -92,7 +96,7 @@ class Value(Expr):
             op = ops.Alias(arg=self, name=name)
 
         return op.to_expr()
-
+    # 返回当前表达式的数据类型（如 Int64, String, Timestamp 等）
     # TODO(kszucs): should rename to dtype
     def type(self) -> dt.DataType:
         """Return the [DataType](./datatypes.qmd) of `self`.
@@ -141,7 +145,8 @@ class Value(Expr):
         -4155090522938856779
         """
         return ops.Hash(self).to_expr()
-
+    # 将表达式转换为指定的数据类型（强转）。
+    # 类似于 pandas 的 .astype()。
     @overload
     def cast(
         self, target_type: Literal["string", "str"] | type[str], /

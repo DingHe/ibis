@@ -466,30 +466,40 @@ def _regular_join_method(
     f.__doc__ = _JOIN_DOCSTRING_TEMPLATES[how]
     return f
 
-
+# 作用是将用户传入的各种类型（字符串、表达式、表、函数等）统一“翻译”为 Ibis 的表达式对象（ir.Value），并确保这些表达式与当前的 table 上下文关联。
 def bind(table: Table, value) -> Iterator[ir.Value]:
     """Bind a value to a table expression."""
+    # 用户直接通过字符串引用列（如 t.select("a")）。它创建一个 ops.Field 节点，强制该字段归属于当前 table。
     if isinstance(value, str):
         # TODO(kszucs): perhaps use getattr(table, value) instead for nicer error msg
         yield ops.Field(table, value).to_expr()
+    # 如果传入的是底层的 IR 操作节点，调用 .to_expr() 将其包装为用户可操作的表达式对象。
     elif isinstance(value, ops.Value):
         yield value.to_expr()
+    # Value (IR 表达式): 如果已经是合法的 Ibis 表达式，直接返回。
     elif isinstance(value, Value):
         yield value
+    # Table: 如果传入一个完整的表（如 t.select(other_table)），它会遍历该表的所有列，并为每一列生成指向该表的 ops.Field。这是实现“展开表所有字段”功能的关键。
     elif isinstance(value, Table):
         for name in value.columns:
             yield ops.Field(value, name).to_expr()
+    # 处理 Ibis 的延迟对象（如 _ 符号），调用 .resolve(table) 将其绑定到当前表，使其具象化。
     elif isinstance(value, Deferred):
         yield value.resolve(table)
+    # Resolver: 处理复杂的解析逻辑，将 table 注入到解析器中。
     elif isinstance(value, Resolver):
         yield value.resolve({"_": table})
+    # Expandable: 处理支持递归展开的对象（例如 * 展开符或复杂的宏），调用 .expand(table) 获取一组字段。
     elif isinstance(value, Expandable):
         yield from value.expand(table)
+    # 最灵活的路径（支持 lambda t: t.a + t.b）。
+    # 先执行 value(table)，将当前表作为参数传给用户函数，得到结果后再递归调用 bind
     elif callable(value):
         # rebind, otherwise the callable is required to return an expression
         # which would preclude support for expressions like lambda _: 2
         yield from bind(table, value(table))
     else:
+        # 如果传入的是标量（如整数 1 或字符串 "foo"），使用 literal(value) 将其转为 Ibis 的常量表达式（ops.Literal）
         yield literal(value)
 
 
@@ -512,6 +522,12 @@ def unwrap_aliases(values: Iterator[ir.Value]) -> Mapping[str, ir.Value]:
             )
         result[node.name] = unwrap_alias(node)
     return result
+
+# Table 类是核心的数据抽象类，代表一个不可变（Immutable）且惰性（Lazy）的 DataFrame。
+# Table 类类似于 SQL 中的表或 pandas 的 DataFrame，它是 Ibis 进行所有数据处理的基石。
+# 不可变性 (Immutability)：对 Table 的任何操作（如过滤、选择、聚合）都不会修改原表，而是返回一个新的 Table 对象。
+# 惰性执行 (Laziness)：当你调用方法时，Ibis 不会立即运行计算，而是构建一个逻辑表达式树（Symbolic Expression）。只有当你显式调用 .execute() 或在交互式环境中触发显示时，Ibis 才会将该表达式编译为特定后端（如 DuckDB, PostgreSQL, BigQuery）的 SQL 并执行。
+# 统一接口：它屏蔽了底层数据库差异，让用户可以用相同的 Python 代码操作不同数据源。
 
 
 @public
@@ -550,10 +566,11 @@ class Table(Expr, FixedTextJupyterMixin):
     """
 
     # Higher than numpy objects
+    # 设置为 20，确保在与 NumPy 对象运算时，Ibis 具有更高的优先级，防止混淆。
     __array_priority__ = 20
-
+    # 显式禁用 NumPy 的通用函数接口，强制通过 Ibis 的表达式系统进行运算。
     __array_ufunc__ = None
-
+    # 返回表的完全限定名（如 catalog.database.table），用于标识在后端中的位置。
     def get_name(self) -> str:
         """Return the fully qualified name of the table.
 
@@ -626,22 +643,33 @@ class Table(Expr, FixedTextJupyterMixin):
         **kwargs: Any,
     ) -> pa.Table:
         return super().to_pyarrow(params=params, limit=limit, **kwargs)
-
+    # 核心作用是将用户传入的各种形式的输入（如列表、字典、单个表达式等）统一“绑定”（Bind）到当前表上
+    # self: 当前的 Table 对象实例（即要进行绑定操作的目标表）
+    # *args: 可变位置参数。用户可以传入一个列表、多个独立的列表达式。
+    # **kwargs: 可变关键字参数。用户可以传入命名表达式，例如 new_col=t.a + 1
     def _fast_bind(self, *args, **kwargs):
         # allow the first argument to be either a dictionary or a list of values
+        #第一阶段：规范化输入 (Normalization)
+        # 将复杂的混合输入（位置参数和关键字参数）统一格式化
         if len(args) == 1:
+            # # 如果 args 只传了一个字典，将其合并到 kwargs 中作为命名列处理
             if isinstance(args[0], dict):
                 kwargs = {**args[0], **kwargs}
                 args = ()
             else:
+                # # 如果 args 是单个列表或其他可迭代对象，将其展开为列表
                 args = util.promote_list(args[0])
         # bind positional arguments
+        # 第二阶段：绑定位置参数 (Positional Binding)
+        # bind(self, arg): 这是一个 Ibis 内部的全局函数，用于解析 arg。如果 arg 是字符串，它会尝试查找表中的列；如果是表达式，它会验证其血缘关系。
         values = []
         for arg in args:
             values.extend(bind(self, arg))
 
         # bind keyword arguments where each entry can produce only one value
         # which is then named with the given key
+        # 第三阶段：绑定关键字参数 (Keyword Binding)
+        # 关键字参数具有强制性约束：每个参数必须且只能产生一个结果（即一列）。
         for key, arg in kwargs.items():
             bindings = tuple(bind(self, arg))
             if len(bindings) != 1:
@@ -652,6 +680,15 @@ class Table(Expr, FixedTextJupyterMixin):
             values.append(value.name(key))
         return values
 
+
+    # 主要职责是将各种“类列输入”（字符串名、整数索引、选择器、延迟表达式等）统一转换为 Ibis 内部标准化的 Value 表达式对象，并处理逻辑引用（Dereferencing）。
+    # 这是 select()、mutate()、group_by() 等高层 API 能够支持灵活参数语法的幕后推手。
+    # *args 接收不定数量的列引用 字符串（如 "col_name"） 整数（如 0，表示第 0 列） Ibis 表达式（如 t.col_a） 选择器（如 ibis.selectors.numeric()） Deferred 对象（如 _.col_a）
+    # **kwargs 接收带名称的表达式，常用于重命名或创建新计算列 key=value，其中 key 会成为该表达式在结果表中的列名
+    # bind 方法解决了 Ibis 作为一个表达式系统最核心的难题：上下文统一
+    # 处理嵌套: 如果你传入的表达式来自另一个表（例如在 join 或子查询中），dm.dereference 会尝试将其与当前表节点对齐。
+    # 支持语法糖: 用户在 select("a") 中传入字符串，bind 负责查表并将其变成 Table.a 对应的算子对象。
+    # 名称一致性: 通过 expr.get_name() 和 .name() 链式调用，确保了在复杂的变换过程中（如 t.select(new_name=t.old_col)），列名信息不会丢失，SQL 输出时的 AS 子句能准确生成。
     def bind(self, *args: Any, **kwargs: Any) -> tuple[Value, ...]:
         """Bind column values to a table expression.
 
@@ -671,14 +708,31 @@ class Table(Expr, FixedTextJupyterMixin):
         tuple[Value, ...]
             A tuple of bound values
         """
+        # 1. 构建引用映射表 (DerefMap)
+        # self.op() 获取当前表的底层算子节点。
+        # DerefMap.from_targets 会分析当前表结构，创建一个映射，
+        # 用于将“对表的引用”解析为该表具体的列算子。
         dm = DerefMap.from_targets(self.op())
-
+        # 2. 快速绑定 (_fast_bind)
+        # 这是一个内部方法，负责将 args 和 kwargs 中的各种类型
+        # (str, int, selector, deferred) 转化为具体的 Ibis Value 表达式对象。
+        # 此阶段尚未处理“引用消解”，只是将输入标准化。
         bound = self._fast_bind(*args, **kwargs)
+        # 3. 引用消解与标准化 (Dereferencing)
+        # 使用列表推导式遍历绑定后的表达式，执行三个核心逻辑：
         return tuple(
+            # a. 逻辑：如果原始对象与消解后的对象不同，说明该列引用了外部表或上下文，
+            #    需要将其重新绑定到当前表，并确保名称正确 (.name(name))。
+            #    如果相同（original is derefed），说明已经是当前表的一列，直接返回原对象。
             derefed.to_expr().name(name) if original is not derefed else original
+            # b. zip 的输入源：
             for name, original, derefed in zip(
+                # 获取每个表达式期望的名称
                 (expr.get_name() for expr in bound),
+                # 原始绑定对象
                 bound,
+                # dm.dereference: 在映射表中查找，将所有表达式“降级”或“解析”为
+                # 当前表的底层列算子。这是保证后续 SQL 生成正确的关键。
                 dm.dereference(*(expr.op() for expr in bound)),
             )
         )
@@ -752,7 +806,7 @@ class Table(Expr, FixedTextJupyterMixin):
         True
         """
         return self
-
+    # 检查指定列名是否存在于表中（支持 if "col" in table 语法）。
     def __contains__(self, name: str, /) -> bool:
         """Return whether `name` is a column in the table.
 
@@ -1249,7 +1303,7 @@ class Table(Expr, FixedTextJupyterMixin):
          'year')
         """
         return self._arg.schema.names
-
+    # 返回表的 Schema 对象，包含各列的名称和数据类型
     def schema(self) -> sch.Schema:
         """Return the [Schema](./schemas.qmd#ibis.expr.schema.Schema) for this table.
 
@@ -2446,6 +2500,12 @@ class Table(Expr, FixedTextJupyterMixin):
         # (unless overridden by mutations in **values)
         return ops.Project(self, {**node.fields, **values}).to_expr()
 
+    # 实现 SQL SELECT 子句的核心方法。是根据指定的列、计算表达式或聚合函数，从原表中构建一个新的“投影（Projection）”表达式
+    # 接收一个或多个列名（字符串）、列表达式对象（如 t.col_a）、或者是选择器（如 ibis.selectors）。
+    # 灵活性: 支持传入列表（例如 t.select(["a", "b"])），Ibis 会自动展平处理。
+    # *exprs (位置参数)
+    # **named_exprs (关键字参数) 用于在选择的同时给新列命名或创建计算列
+    # 例子: t.select(new_name=t.old_col + 1)，这在 SQL 中相当于 SELECT old_col + 1 AS new_name。
     def select(
         self,
         *exprs: ir.Value | str | Iterable[ir.Value | str] | Deferred,
@@ -2625,9 +2685,13 @@ class Table(Expr, FixedTextJupyterMixin):
         """
         # note that if changes are made to implementation of select,
         # corresponding changes may be needed in `.mutate()`
+        # 导入重写规则工具，用于处理投影中的特殊输入（如聚合函数）
         from ibis.expr.rewrites import rewrite_project_input
-
+        # 1. 绑定输入：将传入的参数解析为统一的表达式字典
+        # self.bind 会处理字符串到列的映射，解析选择器，并整合位置参数与关键字参数
         values = self.bind(*exprs, **named_exprs)
+        # 2. 解包别名：处理嵌套的别名表达式
+        # 如果用户传入了 .name("alias")，确保底层结构正确识别该名称
         values = unwrap_aliases(values)
         if not values:
             raise com.IbisTypeError(
@@ -2636,9 +2700,19 @@ class Table(Expr, FixedTextJupyterMixin):
 
         # we need to detect reductions which are either turned into window functions
         # or scalar subqueries depending on whether they are originating from self
+        # 4. 处理聚合与窗口函数：
+        # 这是 Ibis 的核心黑魔法之一。
+        # 如果用户在 select 中传入了聚合函数（如 t.col.mean()），
+        # rewrite_project_input 会检查该表达式：
+        # - 若聚合基于当前表，则将其自动转换为“窗口函数”（Window Function），
+        #   这样结果会广播到每一行，实现“列名 + 均值”的并列显示。
         values = {
             k: rewrite_project_input(v, relation=self.op()) for k, v in values.items()
         }
+        # 5. 构建逻辑计划并返回：
+        # ops.Project 是 Ibis 逻辑计划中的“投影算子”。
+        # 它将原表 (self) 和处理后的列映射 (values) 封装成一个节点，
+        # 最后通过 .to_expr() 将其包装回用户友好的 Ibis 表达式对象。
         return ops.Project(self, values).to_expr()
 
     projection = select

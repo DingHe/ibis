@@ -88,7 +88,9 @@ def is_one_of(values: Sequence[T], t: type[U]) -> Iterator[bool]:
 any_of = toolz.compose(any, is_one_of)
 all_of = toolz.compose(all, is_one_of)
 
-
+# 核心作用是将任意输入强制转换为列表类型。
+# 在 Ibis 的 API 设计中，用户往往既可以传入单个对象（如一个表或一个列），也可以传入集合（如多个表或多个列），
+# 该函数统一了这种输入格式，方便后续的代码进行一致性处理。
 def promote_list(val: V | Iterable[V]) -> list[V]:
     """Ensure that the value is a list.
 

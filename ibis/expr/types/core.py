@@ -34,27 +34,33 @@ if TYPE_CHECKING:
     from ibis.expr.sql import SQLString
     from ibis.expr.visualize import EdgeAttributeGetter, NodeAttributeGetter
 
-
+# Expr 类是整个表达式系统（Expression System）的根基类。
+# 不仅是所有用户级 API 对象（如 TableExpr、ColumnExpr、ScalarExpr）的父类，更是连接“前端逻辑表示”与“后端执行引擎”的核心接口层。
+# 设计目标是提供一套统一的、惰性计算的抽象接口。它的主要职责包括：
+# 持有计算逻辑：通过封装 ops.Node，定义了数据的计算方式（即查询计划的 DAG 节点）。
+# 连接后端（Backend Binding）：自动解析表达式依赖的后端（如 DuckDB、BigQuery），并分发具体的执行任务。
 @public
 class Expr(Immutable, Coercible):
     """Base expression class."""
 
     __slots__ = ("_arg",)
+    # 表达式的核心负载。
+    # 指向底层的逻辑算子节点（Node），该节点完整描述了该表达式的计算路径。
     _arg: ops.Node
-
+    # 生成非交互模式下的文本描述。若配置允许，会显示变量作用域。
     def _noninteractive_repr(self) -> str:
         if ibis.options.repr.show_variables:
             scope = get_defining_scope(self, types=Expr)
         else:
             scope = None
         return pretty(self.op(), scope=scope)
-
+    # 根据 ibis.options.interactive 决定返回富文本渲染（Notebook 环境）还是简单文本。
     def __repr__(self) -> str:
         if ibis.options.interactive:
             return capture_rich_renderable(self)
         else:
             return self._noninteractive_repr()
-
+    # 兼容 rich 库，用于在终端或 Notebook 中优雅地展示表达式结构（支持自动宽限设置）。
     def __rich_console__(self, console: Console, options):
         from rich.text import Text
 
@@ -84,13 +90,13 @@ class Expr(Immutable, Coercible):
             ]
             return Text("\n".join(lines))
         return console.render(rich_object, options=options)
-
+    # 将一个逻辑算子节点赋值给 _arg
     def __init__(self, arg: ops.Node) -> None:
         object.__setattr__(self, "_arg", arg)
 
     def __iter__(self) -> NoReturn:
         raise TypeError(f"{self.__class__.__name__!r} object is not iterable")
-
+    # 将普通对象尝试转换为 Expr。如果输入已经是 Expr 则返回，如果是 ops.Node 则调用 to_expr() 升维。
     @classmethod
     def __coerce__(cls, value):
         if isinstance(value, cls):
@@ -99,13 +105,13 @@ class Expr(Immutable, Coercible):
             return value.to_expr()
         else:
             raise CoercionError("Unable to coerce value to an expression")
-
+    # 支持 Python 的 pickle 序列化，序列化时仅存储底层逻辑节点。
     def __reduce__(self):
         return (self.__class__, (self._arg,))
-
+    # 基于类名和 _arg 计算哈希，确保表达式对象在集合中可作为键使用，且结构相同的表达式哈希一致。
     def __hash__(self):
         return hash((self.__class__, self._arg))
-
+    # 结构化相等性检查。比较两个表达式的逻辑节点是否完全一致（而非值相等）。
     def equals(self, other, /) -> bool:
         """Return whether this expression is _structurally_ equivalent to `other`.
 
@@ -137,11 +143,11 @@ class Expr(Immutable, Coercible):
         raise ValueError("The truth value of an Ibis expression is not defined")
 
     __nonzero__ = __bool__
-
+    # 返回当前表达式的名称（别名）。
     def get_name(self):
         """Return the name of this expression."""
         return self._arg.name
-
+    # Notebook 环境下自动触发的预览功能，尝试使用 GraphViz 生成表达式的图形化 PNG。
     def _repr_png_(self) -> bytes | None:
         if opts.interactive or not opts.graphviz_repr:
             return None
@@ -154,7 +160,7 @@ class Expr(Immutable, Coercible):
             # so fallback to the default text representation.
             with contextlib.suppress(Exception):
                 return viz.to_graph(self).pipe(format="png")
-
+    # 生成并打开一个交互式的 GraphViz 流程图，可视化表达式的 DAG 结构，支持自定义节点和边样式。
     def visualize(
         self,
         format: str = "svg",
@@ -282,10 +288,10 @@ class Expr(Immutable, Coercible):
             return f(*args, **kwargs)
         else:
             return f(self, *args, **kwargs)
-
+    # 返回底层的 ops.Node 对象
     def op(self) -> ops.Node:
         return self._arg
-
+    # 递归遍历表达式树，查找所有引用的数据源（Backend），并标记是否存在未绑定的表。
     def _find_backends(self) -> tuple[list[BaseBackend], bool]:
         """Return the possible backends for an expression.
 
@@ -305,7 +311,7 @@ class Expr(Immutable, Coercible):
                 backends.add(table.source)
 
         return list(backends), has_unbound
-
+    # 查找表达式所属的单一后端。如果未找到，且 use_default=True，则返回全局默认后端。
     def _find_backend(self, *, use_default: bool = False) -> BaseBackend:
         """Find the backend attached to an expression.
 
@@ -343,7 +349,7 @@ class Expr(Immutable, Coercible):
             raise IbisError("Multiple backends found for this expression")
 
         return backends[0]
-
+    # 获取该表达式绑定的 Ibis 后端对象
     def get_backend(self) -> BaseBackend:
         """Get the current Ibis backend of the expression.
 
@@ -365,7 +371,7 @@ class Expr(Immutable, Coercible):
         [`ibis.get_backend()`](./connection.qmd#ibis.get_backend)
         """
         return self._find_backend(use_default=True)
-
+    # 调用后端执行引擎，返回 Pandas DataFrame/Series 或标量结果。
     def execute(
         self,
         *,
@@ -532,7 +538,7 @@ class Expr(Immutable, Coercible):
         return self._find_backend().compile(
             self, limit=limit, params=params, pretty=pretty
         )
-
+    # 流式执行，返回 RecordBatchReader，适合处理大数据集。
     @experimental
     def to_pyarrow_batches(
         self,
@@ -571,7 +577,7 @@ class Expr(Immutable, Coercible):
             chunk_size=chunk_size,
             **kwargs,
         )
-
+    # 执行并转换为 PyArrow 对象（Table/Array/Scalar）
     @experimental
     def to_pyarrow(
         self,
@@ -605,7 +611,7 @@ class Expr(Immutable, Coercible):
         return self._find_backend(use_default=True).to_pyarrow(
             self, params=params, limit=limit, **kwargs
         )
-
+    # 执行并直接转为 Polars DataFrame
     @experimental
     def to_polars(
         self,

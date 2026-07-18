@@ -32,7 +32,12 @@ x = var("x")
 y = var("y")
 name = var("name")
 
-
+# DerefMap 是一个核心工具类，主要用于关系代数表达式的“解引用”（Dereferencing）。它是 Ibis 能够实现优雅、链式 API 的关键基础设施
+# 在 Ibis 的关系表达式（IR）中，每个操作通常只能引用其“直接父节点”的字段。然而，为了用户体验，Ibis 允许用户在链式操作中引用更早期的关系（例如：t2.filter(t.a > 0) 中，用户引用了最原始的表 t，而不是 t2 的直接来源 t1）
+# 核心职责是：
+# 追踪溯源：在关系层级中向上遍历，找到字段的原始定义
+# 重写表达式：将用户在表达式中使用的“跨层级”字段引用，自动替换为当前关系能够直接识别的字段引用。
+# 处理歧义：如果同一个字段名在多个父关系中存在，它会检测并报错，防止逻辑混淆。
 class DerefMap(Annotable, Traversable):
     """Trace and replace fields from earlier relations in the hierarchy.
 
@@ -59,18 +64,24 @@ class DerefMap(Annotable, Traversable):
     """
 
     """The relations we want the values to point to."""
+    # 存储当前解引用操作的目标关系集合。
+    # 所有待处理的字段最终都会被尝试映射为指向这些关系（或其子集）的引用。
     rels: frozenset[ops.Relation]
 
     """Extra substitutions to be added to the dereference map. Stored on the
     instance to facilitate lazy dereferencing."""
+    # 允许用户手动注入额外的替换规则。常用于复杂的子查询或特定优化场景，实现“懒加载”式的替换。
     extra: Optional[FrozenDict[ops.Node, ops.Node]]
 
     """Substitution mapping from values of earlier relations to the fields of `rels`."""
+    # 核心映射表。缓存了“早期字段 → 当前可直接引用的字段”的映射关系。
+    # 该属性在首次调用 dereference 时通过 _fill_substitution_mappings 延迟计算填充。
     subs: Optional[FrozenDict[ops.Value, ops.Field]] = None
 
     """Ambiguous field references."""
+    # 记录歧义字段。如果一个表达式在多个父级中都能找到对应，且无法确定唯一来源，则记录在此，在解引用时触发 IbisInputError。
     ambigs: Optional[FrozenDict[ops.Value, VarTuple[ops.Value]]] = None
-
+    # 将输入的单个或多个关系包装为 frozenset，确保了内部处理的一致性，是创建该类的标准入口。
     @classmethod
     def from_targets(
         cls, rels, extra: Mapping[ops.Node, ops.Node] | None = None
@@ -92,7 +103,8 @@ class DerefMap(Annotable, Traversable):
         DerefMap
         """
         return cls(rels=frozenset(promote_list(rels)), extra=extra)
-
+    # 实现血缘追踪（Lineage Tracing）的核心逻辑。
+    # 作用是：沿着表达式树向上“爬”，找到一个字段在当前关系层级中的原始定义来源。
     @classmethod
     def backtrack(cls, value) -> Iterator[tuple[ops.Field, int]]:
         """Backtrack the field in the relation hierarchy.
@@ -110,48 +122,63 @@ class DerefMap(Annotable, Traversable):
         tuple[ops.Field, int]
             The value node and the distance from the original value.
         """
+        # distance 用于记录“辈分”。
+        # 原始字段距离为 0，每向上回溯一层（通过 rel.values 查找），距离加 1。
         distance = 0
         # track down the field in the hierarchy until no modification
         # is made so only follow ops.Field nodes not arbitrary values;
+        # 只追踪“字段引用”节点
+        # 如果当前节点不再是字段（例如变成了计算表达式 a + 1），循环就会停止
         while isinstance(value, ops.Field):
             yield value, distance
+            # 从当前字段的父关系（rel）中，根据字段名重新获取该字段在上一层定义的值（values 映射表）。这实现了跨关系层级的向上搜索。
             value = value.rel.values.get(value.name)
             distance += 1
         if (
-            value is not None
-            and value.relations
-            and not value.find(ops.Impure, filter=ops.Value)
+            value is not None # 确保不是空值
+            and value.relations # 确保该节点确实关联了某个表，是合法的关系表达式。
+            and not value.find(ops.Impure, filter=ops.Value) # 如果字段的计算涉及到“不纯”操作（例如调用了 random() 或其他非确定性函数），则停止追踪。因为不可预测的表达式无法保证跨层级的语义等价，不能盲目地进行解引用替换。
         ):
             yield value, distance
 
+
+    # 主要作用是预计算：通过分析当前的各个关系（rels）及其字段来源，构建出一个“查找表”（Lookup Table）。
+    # 表明确了“如果用户引用了祖先节点字段 X，那么在当前节点下，我应该用哪个字段 Y 来替换它”。
     def _fill_substitution_mappings(self) -> None:
+        # 首先检查 self.subs 和 self.ambigs 是否已经存在。如果是，直接返回。这确保了昂贵的映射计算过程每个实例只会运行一次（懒加载模式）
         if self.subs is not None and self.ambigs is not None:
             return
 
         mapping = defaultdict(dict)
-
+        # 遍历所有的目标关系（rel），以及这些关系中的每一个字段（field）
         for rel in self.rels:
             for field in rel.fields.values():
                 for val, distance in self.__class__.backtrack(field):
+                    # { 原始根节点 (val) : { 当前层级可用字段 (field) : 距离 (distance) } }
+                    # 原始字段 val 可以通过 field 访问，代价是 distance 层
                     mapping[val][field] = distance
-
+        # 决策：生成替换表或歧义表
         subs, ambigs = {}, {}
         for from_, to in mapping.items():
             mindist = min(to.values())
             minkeys = [k for k, v in to.items() if v == mindist]
             # if all the closest fields are from the same relation, then we
             # can safely substitute them and we pick the first one arbitrarily
+            # 对于每个原始字段（from_），它在当前关系中可能有多个访问路径。我们取距离最近的那个（mindist）
+            # 安全情况：如果所有“距离最短”的候选字段都源自同一个关系（minkeys[0].relations == k.relations），
+            # 则说明它们在语义上是等价的，可以直接替换。我们任选其一（通常是第一个）存入 subs。
             if all(minkeys[0].relations == k.relations for k in minkeys):
                 subs[from_] = minkeys[0]
+            # 歧义情况：如果最优距离的候选者来自不同的关系（例如左右表都有一个叫 id 的字段），Ibis 无法自动决定用哪一个，此时将其存入 ambigs，后续调用 dereference 时会报错。
             else:
                 ambigs[from_] = minkeys
-
+        # 将初始化时传入的 extra（用户自定义的额外替换规则）合并到 subs 中。这允许在自动推断之外，进行人工干预或强制指定映射。
         if extra := self.extra:
             subs.update(extra)
 
         self.subs = subs
         self.ambigs = ambigs
-
+    # 方法处理传入的多个表达式 (*values)，逐一进行解引用
     def dereference(self, *values: ir.Value) -> Iterator[ops.Value]:
         """Dereference values to target relations.
 
@@ -169,17 +196,21 @@ class DerefMap(Annotable, Traversable):
             The dereferenced values.
         """
         for v in values:
+
             if (rels := v.relations) and rels != self.rels:
                 # called on every iteration but only does work once per
                 # instance
                 self._fill_substitution_mappings()
-
+                # 在执行替换前，使用 v.find() 在表达式树中搜索是否存在“歧义字段”。
                 if ambigs := v.find(self.ambigs.__contains__, filter=ops.Value):
                     raise IbisInputError(
                         f"Ambiguous field reference {ambigs!r} in expression {v!r}"
                     )
+                # 执行表达式重写
+                # 会遍历表达式树中的每一个节点。如果某个节点（如 ops.Field）存在于 self.subs 映射表中，它就会被替换为指向当前关系的目标节点。
                 yield v.replace(self.subs, filter=ops.Value)
             else:
+                # 如果表达式 v 的关联关系（v.relations）已经属于当前目标 self.rels，则说明它已经是“本地化”的，无需任何处理，直接 yield v 返回
                 yield v
 
 
