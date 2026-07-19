@@ -61,7 +61,14 @@ if TYPE_CHECKING:
 
 ALL_OPERATIONS = frozenset(get_subclasses(ops.Node))
 
-
+# AggGen 是一个描述符类,专门用来生成/编译 SQL 里的聚合函数调用(比如 SUM、COUNT、AVG 等)。
+# 核心价值在于:不同的聚合函数在生成 SQL 时,可能需要处理一些"通用但又不完全一致"的额外逻辑,比如:
+# FILTER 子句:某些数据库支持 SUM(x) FILTER (WHERE cond) 这种语法,在聚合前先过滤行;
+# ORDER BY:某些聚合函数(比如 STRING_AGG、ARRAY_AGG)在聚合之前需要指定排序顺序,即 STRING_AGG(x ORDER BY y)。
+# 但并不是所有 SQL 方言都原生支持这两种子句。AggGen 把这些"支持与否"的差异,抽象成两个布尔开关(supports_filter、supports_order_by),通过统一的 aggregate 方法,自动决定:
+# 如果方言原生支持 FILTER,就直接生成 FILTER 子句;
+# 如果不支持,就退化成用 CASE WHEN(即 if_)在参数层面手动做过滤,把不满足条件的值替换成 NULL,让聚合函数自然忽略它们;
+# 如果方言不支持 ORDER BY 却调用时传了 order_by,直接抛异常,提示该方言不支持这种"排序敏感的聚合"。
 class AggGen:
     """A descriptor for compiling aggregate functions.
 
@@ -77,23 +84,27 @@ class AggGen:
         Whether the backend supports an ORDER BY clause in (relevant)
         aggregates. Defaults to False.
     """
-
+    # 专门用来支持"属性访问"和"下标访问"两种语法糖,让调用方可以写 compiler.agg.sum(...) 或 compiler.agg["sum"](...),
+    # 而不必写成 compiler.agg.aggregate(compiler, "sum", ...) 这种繁琐形式。
     class _Accessor:
         """An internal type to handle getattr/getitem access."""
-
+        # __slots__ = ("compiler", "handler"):限定这个类的实例只能有 compiler 和 handler 两个属性(不能动态添加别的属性),这是一种内存优化手段,避免每个实例都携带一个 __dict__。
         __slots__ = ("compiler", "handler")
-
+        # handler:实际要调用的处理函数(在这里就是 AggGen.aggregate 这个方法本身,还未绑定具体名字)。
+        # compiler:所属的编译器实例(比如某个具体方言的 SQLGlotCompiler 子类实例),后续调用聚合函数时要用到它(比如取 compiler.f[name]、compiler.dialect 等)。
         def __init__(self, handler: Callable, compiler: SQLGlotCompiler):
             self.handler = handler
             self.compiler = compiler
-
+        # 当访问这个对象上任意一个属性名(比如 .sum、.count、.avg)时,Python 找不到已定义的同名属性,就会触发 __getattr__。
+        # 这里的处理是:用 functools.partial 把 self.handler(即 AggGen.aggregate 方法)、self.compiler(编译器实例)和 name(访问的属性名,即聚合函数名,比如 "sum")预先绑定,
+        # 返回一个"只需要再传参数(和可选的 where/order_by)"就能调用的偏函数。
         def __getattr__(self, name: str) -> Callable:
             return partial(self.handler, self.compiler, name)
-
+        # 把 __getitem__(下标访问,比如 accessor["sum"])也指向同一个 __getattr__ 实现,这样 accessor["sum"](col) 和 accessor.sum(col) 效果完全一致——支持了两种等价的调用语法(属性式和字典式),方便在某些聚合函数名恰好是 Python 关键字或存在特殊字符时,也可以用下标方式访问。
         __getitem__ = __getattr__
 
     __slots__ = ("supports_filter", "supports_order_by")
-
+    # 接收两个仅限关键字的布尔参数(前面的 * 强制调用方必须用关键字方式传参,不能位置传参),并保存为实例属性:
     def __init__(
         self, *, supports_filter: bool = False, supports_order_by: bool = False
     ):
@@ -105,7 +116,12 @@ class AggGen:
             return self
 
         return AggGen._Accessor(self.aggregate, instance)
-
+    # 真正执行"编译某个具体聚合函数"逻辑的方法
+    # compiler:调用方所属的编译器实例,用来访问该方言下的函数构造器 compiler.f、条件表达式辅助方法 compiler.if_、方言名 compiler.dialect 等。
+    # name:要编译的聚合函数名字(比如 "sum"、"count")。
+    # *args:传给该聚合函数的位置参数(通常是要聚合的列表达式,可能有多个,比如某些聚合函数需要不止一个参数)。
+    # where(关键字参数,默认 None):一个可选的过滤条件,对应 SQL 里聚合前的行过滤(即 FILTER 或退化成 CASE WHEN)。
+    # order_by(关键字参数,默认空元组):一个可选的排序键元组,对应聚合内部的排序(即 ORDER BY)。
     def aggregate(
         self,
         compiler: SQLGlotCompiler,
@@ -130,6 +146,7 @@ class AggGen:
             Optional ordering keys to use to order the rows before performing
             the aggregate.
         """
+        # 从编译器实例的 f(应该是一个"函数工厂",支持通过下标获取某个 SQL 函数的可调用构造器)里,取出对应 name 名字的函数构造器,赋值给 func。之后 func(*args) 就相当于构造出诸如 SUM(x) 这样的 sqlglot 函数表达式。
         func = compiler.f[name]
 
         if order_by and not self.supports_order_by:
@@ -174,10 +191,22 @@ class AnonymousFuncGen:
     def __getitem__(self, key: str) -> Callable[..., sge.Anonymous]:
         return getattr(self, key)
 
-
+# FuncGen 是一个函数生成器 / 函数工厂类,专门用来把"函数名字符串"动态转换成对应的 sqlglot 函数调用表达式(sge.Func 及其子类)
+# 核心价值在于:SQL 里有海量的内置函数(ABS、UPPER、DATE_TRUNC 等等),不可能给每个函数都手写一个 Python 方法。FuncGen 通过重写 __getattr__,
+# 实现了"访问任意属性名,都自动生成对应名字的 SQL 函数调用"的动态分发机制——比如 f.abs(x) 会自动生成 ABS(x) 对应的 sqlglot 表达式,而不需要预先在类里定义一个 abs 方法。
+# 同时,对于少数几个"不能简单套用通用函数调用模板"的特殊结构(比如数组字面量 ARRAY[...]、EXISTS(...)、字符串拼接 CONCAT 等,
+# 它们在 sqlglot 里对应专门的表达式类而非普通函数调用形式),FuncGen 显式定义了对应的方法来覆盖默认的动态分发行为,确保生成正确的 AST 结构。
 class FuncGen:
+    # 限定实例只能拥有这四个属性,不能动态添加其它属性,这是内存优化手段(避免每个实例都携带 __dict__)
+    # anon:一个 AnonymousFuncGen 实例,用于生成"匿名函数调用"(即那些不在 sqlglot 已知函数注册表里的函数,需要特殊处理)。
+    # copy:控制 sqlglot 在构造表达式时是否要深拷贝子节点。
+    # dialect:目标 SQL 方言。
+    # namespace:函数名的命名空间前缀(比如某些方言的函数需要带 schema/package 前缀,如 pg_catalog.abs)。
     __slots__ = ("anon", "copy", "dialect", "namespace")
 
+    # namespace: str | None = None:可选的命名空间前缀字符串,默认为 None。如果某个具体方言的函数需要带命名空间前缀(比如某些数据库的内置函数要写成 schema.func_name 的形式),就通过这个参数指定。保存为 self.namespace。
+    # dialect: sg.Dialect:目标 SQL 方言对象,后续生成函数表达式时会用到它,确保按该方言的语法规则渲染/校验函数名和参数格式。保存为 self.dialect。
+    # copy: bool = False:控制后续调用 sg.func(...) 构造表达式时是否要拷贝参数节点,默认为 False(不拷贝,性能更优,因为通常没必要在构造时额外深拷贝)。保存为 self.copy。
     def __init__(
         self, *, dialect: sg.Dialect, namespace: str | None = None, copy: bool = False
     ) -> None:
@@ -185,9 +214,14 @@ class FuncGen:
         self.namespace = namespace
         self.anon = AnonymousFuncGen()
         self.copy = copy
-
+    # 实现"访问任意属性名,自动生成对应 SQL 函数调用"的机制:
+    # name: str:被访问的属性名,比如调用 f.upper(col) 时,这里的 name 就是字符串 "upper"。
     def __getattr__(self, name: str) -> Callable[..., sge.Func]:
+        # filter(None, (self.namespace, name)):过滤掉元组里的假值(比如 self.namespace 为 None 时会被过滤掉,只留下真正的 name)。
         name = ".".join(filter(None, (self.namespace, name)))
+        # 返回一个闭包函数(lambda),这个 lambda 才是真正被调用的、生成函数表达式的可调用对象。
+        # sg.func(...):sqlglot 提供的通用函数构造辅助函数,根据函数名字符串和参数,构造出对应的 sge.Func(或其已知子类,比如 sqlglot 认识 upper 就会构造出对应的 Upper 表达式类;
+        # 如果不认识这个函数名,会构造成通用的 Anonymous 函数表达式)。
         return lambda *args, **kwargs: sg.func(
             name,
             *map(sge.convert, args),
@@ -244,14 +278,19 @@ FALSE = sge.false()
 TRUE = sge.true()
 STAR = sge.Star()
 
-
+# SQLGlotCompiler 的核心作用是担任“翻译官”的角色：将 Ibis 的内部逻辑表达（一种与具体数据库无关的抽象语法树，即 Ibis Expression Tree）转换成 sqlglot 库所理解的 SQL 表达式树，
+# 进而生成特定数据库（如 PostgreSQL, MySQL, BigQuery, ClickHouse 等）的合法 SQL 语句。
+# 核心工作流：
+# 标准化（Rewrite）： 在编译前通过一系列预定义规则（rewrites）简化表达式，处理不同数据库对 SQL 标准实现不一致的问题。
+# 树遍历（Visitor Pattern）： 采用访问者模式，遍历 Ibis 的操作节点（ops.Node），递归调用 visit_* 方法将其映射为 sqlglot.expressions。
+# 方言化（Dialect）： 利用 sqlglot 的方言能力，将通用的表达式树渲染成目标数据库的特定语法。
 @public
 class SQLGlotCompiler(abc.ABC):
     __slots__ = "f", "v"
 
     agg = AggGen()
     """A generator for handling aggregate functions"""
-
+    # 编译前后的变换规则元组，用于将 Ibis 的复杂操作拆解为目标数据库支持的原子操作。
     rewrites: tuple[type[pats.Replace], ...] = (
         empty_in_values_right_side,
         add_order_by_to_empty_ranking_window_functions,
@@ -265,26 +304,26 @@ class SQLGlotCompiler(abc.ABC):
 
     no_limit_value: sge.Null | None = None
     """The value to use to indicate no limit."""
-
+    # 决定生成的标识符（列名、表名）是否强制加引号
     quoted: bool = True
     """Whether to always quote identifiers."""
 
     copy_func_args: bool = False
     """Whether to copy function arguments when generating SQL."""
-
+    # 标识目标数据库是否支持 QUALIFY 子句（常用于窗口函数过滤）。
     supports_qualify: bool = False
     """Whether the backend supports the QUALIFY clause."""
-
+    # 定义了该后端处理浮点数特殊值（NaN/Inf）的 SQL 字面量形式。
     NAN: ClassVar[sge.Expression] = sge.Cast(
         this=sge.convert("NaN"), to=sge.DataType(this=sge.DataType.Type.DOUBLE)
     )
     """Backend's NaN literal."""
-
+    # 定义了该后端处理浮点数特殊值（NaN/Inf）的 SQL 字面量形式。
     POS_INF: ClassVar[sge.Expression] = sge.Cast(
         this=sge.convert("Inf"), to=sge.DataType(this=sge.DataType.Type.DOUBLE)
     )
     """Backend's positive infinity literal."""
-
+    # 定义了该后端处理浮点数特殊值（NaN/Inf）的 SQL 字面量形式。
     NEG_INF: ClassVar[sge.Expression] = sge.Cast(
         this=sge.convert("-Inf"), to=sge.DataType(this=sge.DataType.Type.DOUBLE)
     )
@@ -299,10 +338,10 @@ class SQLGlotCompiler(abc.ABC):
     """A tuple of ops classes that are supported, but don't have explicit
     `visit_*` methods (usually due to being handled by rewrite rules). Used by
     `has_operation`"""
-
+    # 显式声明该后端不支持的 Ibis 操作，编译遇到时将抛出错误
     UNSUPPORTED_OPS: tuple[type[ops.Node], ...] = ()
     """Tuple of operations the backend doesn't support."""
-
+    # 定义“降级”规则，将高级 Ibis 操作（如 Bucket 分桶）重写为更基础的 SQL 表达式。
     LOWERED_OPS: dict[type[ops.Node], pats.Replace | None] = {
         ops.Bucket: lower_bucket,
         ops.Capitalize: lower_capitalize,
@@ -312,7 +351,7 @@ class SQLGlotCompiler(abc.ABC):
     """A mapping from an operation class to either a rewrite rule for rewriting that
     operation to one composed of lower-level operations ("lowering"), or `None` to
     remove an existing rewrite rule for that operation added in a base class"""
-
+    # 一个映射字典，将 Ibis 的具体算子类（如 ops.Abs）直接映射为目标数据库的函数名字符串（如 "abs"）
     SIMPLE_OPS = {
         ops.Abs: "abs",
         ops.Acos: "acos",
@@ -385,7 +424,7 @@ class SQLGlotCompiler(abc.ABC):
         ops.RandomUUID: "uuid",
         ops.RandomScalar: "rand",
     }
-
+    # 定义二元操作符（如加减乘除、逻辑与或）对应的 sqlglot 表达式类型（如 sge.Add）
     BINARY_INFIX_OPS = {
         # Numeric
         ops.Add: sge.Add,
@@ -448,46 +487,53 @@ class SQLGlotCompiler(abc.ABC):
     # UPPERCASE values to handle inheritance, do not modify directly here.
     extra_supported_ops: ClassVar[frozenset[type[ops.Node]]] = frozenset()
     lowered_ops: ClassVar[dict[type[ops.Node], pats.Replace]] = {}
-
+    # 初始化 FuncGen（函数生成器）和 VarGen（变量生成器），用于在编译时便捷地创建 SQL 函数调用和变量引用。
     def __init__(self) -> None:
         self.f = FuncGen(
             dialect=self.__class__.dialect, copy=self.__class__.copy_func_args
         )
         self.v = VarGen()
-
+    # __init_subclass__ 在 Python 中用于拦截类的创建。
+    # 这段代码的目的是：当用户定义一个新的 SQL 方言编译器（继承自 SQLGlotCompiler）时，自动根据类属性（如 SIMPLE_OPS）生成对应的 visit_ 方法，从而减少大量重复的样板代码。
+    # cls: 代表当前正在被定义的子类（即继承了 SQLGlotCompiler 的类）
+    # **kwargs: 传递给父类初始化的额外参数，保证标准的类创建流程不被中断。
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-
+        # # 将算子类名（如 Addition）映射为编译器方法名（如 visit_Addition）
         def methodname(op: type) -> str:
             assert isinstance(type(op), type), type(op)
             return f"visit_{op.__name__}"
-
+        # 生成简单算子的实现 (SIMPLE_OPS)
+        # 处理那些直接映射到 SQL 函数的操作（如 Sum -> SUM(), Abs -> ABS()）
         def make_impl(op, target_name):
             assert isinstance(type(op), type), type(op)
-
+            # # 如果算子属于 Reduction（聚合操作，如 SUM/AVG）
             if issubclass(op, ops.Reduction):
 
                 def impl(
                     self, _, *, _name: str = target_name, where, order_by=(), **kw
                 ):
                     return self.agg[_name](*kw.values(), where=where, order_by=order_by)
-
+            # # 普通函数调用（如 ABS/LENGTH）
             else:
 
                 def impl(self, _, *, _name: str = target_name, **kw):
                     return self.f[_name](*kw.values())
 
             return impl
-
+        # # 遍历字典自动注册方法：setattr 会将生成的 impl 绑定到新类 cls 上
         for op, target_name in cls.SIMPLE_OPS.items():
             setattr(cls, methodname(op), make_impl(op, target_name))
 
         # Define binary op methods, only if BINARY_INFIX_OPS is set on the
         # compiler class.
+        # 处理二元运算符 (BINARY_INFIX_OPS)
+        # 处理形如 a + b 或 a > b 的中缀表达式，将其映射为 SQLGlot 的二元表达式类。
         if binops := cls.__dict__.get("BINARY_INFIX_OPS", {}):
 
             def make_binop(sge_cls):
                 def impl(self, op, *, left, right):
+                    # # 调用统一的 binop 转换逻辑
                     return self.binop(sge_cls, left, right)
 
                 return impl
@@ -499,12 +545,16 @@ class SQLGlotCompiler(abc.ABC):
         #
         # these *must* be defined after SIMPLE_OPS to handle compilers that
         # subclass other compilers
+        # 处理不支持的算子
+        # 强制要求在遇到不支持的操作时抛出错误，防止编译器静默失败。
+        # 标记显式声明不支持的算子
         for op in cls.UNSUPPORTED_OPS:
             # change to visit_Unsupported in a follow up
             # TODO: handle geoespatial ops as a separate case?
             setattr(cls, methodname(op), cls.visit_Undefined)
 
         # raise on any remaining unsupported operations
+        # # 兜底逻辑：遍历所有 Ibis 已知算子，如果子类中未定义 visit_ 方法，则统一指向 Undefined
         for op in ALL_OPERATIONS:
             name = methodname(op)
             if not hasattr(cls, name):
@@ -512,16 +562,20 @@ class SQLGlotCompiler(abc.ABC):
 
         # Amend `lowered_ops` and `extra_supported_ops` using their
         # respective UPPERCASE classvar values.
+        # 合并 lowered_ops 和 extra_supported_ops
+        # 为了处理“操作重写”逻辑（即编译器在处理复杂算子时，将其降级为多个简单算子的组合）。
+        # # 将子类的配置（UPPERCASE）与父类的基础配置进行合并更新
         extra_supported_ops = set(cls.extra_supported_ops)
         lowered_ops = dict(cls.lowered_ops)
         extra_supported_ops.update(cls.EXTRA_SUPPORTED_OPS)
         for op_cls, rewrite in cls.LOWERED_OPS.items():
             if rewrite is not None:
-                lowered_ops[op_cls] = rewrite
+                lowered_ops[op_cls] = rewrite  # 添加或覆盖重写规则
                 extra_supported_ops.add(op_cls)
             else:
-                lowered_ops.pop(op_cls, None)
+                lowered_ops.pop(op_cls, None)  # 如果设为 None，则移除支持
                 extra_supported_ops.discard(op_cls)
+        # 将结果存回类属性，确保后续编译流程可见
         cls.lowered_ops = lowered_ops
         cls.extra_supported_ops = frozenset(extra_supported_ops)
 
@@ -566,16 +620,20 @@ class SQLGlotCompiler(abc.ABC):
         return sge.Cast(
             this=sge.convert(arg), to=self.type_mapper.from_ibis(to), copy=False
         )
-
+    # 把用户传入的"参数字典"从面向用户的 ibis 表达式形式,转换成面向内部的 op 节点形式,方便后续在遍历表达式树时直接用 op 节点作为 key 去查找对应的具体值
     def _prepare_params(self, params):
         result = {}
         for param, value in params.items():
             node = param.op()
+            # 如果这个参数节点是一个 Alias(即用户可能写了类似 ibis.param(...).name("some_alias") 这种带别名的形式),那么真正“有意义”的、
+            # 参与计算的其实是被包在 Alias 里面的那个原始表达式节点(node.arg,即别名内部真正的算子),
+            # 别名本身只是一层包装,不影响参数值的绑定关系
             if isinstance(node, ops.Alias):
                 node = node.arg
             result[node] = value
         return result
-
+    # 将 Ibis 表达式树（Expression Tree）转换为 SQLGlot 抽象语法树（AST）的核心入口。它是连接 Ibis 高级 API 与底层 SQL 生成逻辑的桥梁。
+    # expr: ir.Expr: 传入的 Ibis 表达式对象（例如 table.filter(...).group_by(...)）
     def to_sqlglot(
         self,
         expr: ir.Expr,
@@ -584,26 +642,39 @@ class SQLGlotCompiler(abc.ABC):
         params: Mapping[ir.Expr, Any] | None = None,
     ):
         import ibis
-
+        # 1. 强制将表达式转换为表格式
+        # 无论用户传入的是标量（Scalar）还是表表达式，都统一转化为 Table 表达式，
+        # 因为所有 SQL 查询最终的输出都是一张“表”。
         table_expr = expr.as_table()
-
+        # 2. 处理 limit 参数
+        # 如果用户指定了 "default"，则从 Ibis 全局配置中获取默认行数。
         if limit == "default":
             limit = ibis.options.sql.default_limit
+        # 如果存在 limit，则在表达式树上动态附加一个 limit 算子。
         if limit is not None:
             table_expr = table_expr.limit(limit)
 
         if params is None:
             params = {}
-
+        # 4. 核心编译步骤：翻译算子树
+        # self.translate 是 SQLGlotCompiler 的递归核心，负责遍历 Ibis 的算子图 (op)，
+        # 并将其逐个映射为 SQLGlot 的表达式 (sge)。
         sql = self.translate(table_expr.op(), params=params)
+        # 5. 断言检查：防止顶级查询意外变成子查询
+        # 在 SQL 顶层，必须是一个 SELECT 语句，不能是包装在括号里的子查询。
         assert not isinstance(sql, sge.Subquery)
-
+        # 6. 标准化输出：处理纯表对象的情况
+        # 如果 translate 的结果仅仅是一个表节点（例如直接执行 t.to_sqlglot()），
+        # SQLGlot 需要将其显式转换为 SELECT * FROM t 的形式，才能作为合法的 SQL 查询。
         if isinstance(sql, sge.Table):
             sql = sg.select(STAR, copy=False).from_(sql, copy=False)
 
         assert not isinstance(sql, sge.Subquery)
         return sql
-
+    # 整个 SQL 生成流程的逻辑枢纽。
+    # 将高层的 Ibis 算子图（DAG）转换为 SQLGlot 的 AST 表达式，并负责处理表别名（Alias）和通用表表达式（CTE）。
+    # op: 要翻译的根 Ibis 算子节点（通常是一个 ops.Relation 或 ops.Value）
+    # params: Mapping[ir.Value, Any]: 外部传入的参数映射（例如将变量名替换为具体的过滤值）。
     def translate(self, op, *, params: Mapping[ir.Value, Any]) -> sge.Expression:
         """Translate an ibis operation to a sqlglot expression.
 
@@ -628,38 +699,52 @@ class SQLGlotCompiler(abc.ABC):
         """
         # substitute parameters immediately to avoid having to define a
         # ScalarParameter translation rule
+        # 1. 替换参数：将 Ibis 表达式中的参数节点替换为具体值，避免后续定义复杂的翻译规则
         params = self._prepare_params(params)
+        # 2. 算子降级 (Lowering)：如果某些算子在目标方言中不支持，将其拆解为基础算子组合
         if self.lowered_ops:
             op = op.replace(reduce(operator.or_, self.lowered_ops.values()))
+        # 3. 规范化 SQL 化 (sqlize)：这是关键步骤，它将算子图重写为“友好的 SQL 结构”
+        # 返回重写后的算子树 `op` 和需要提取为 CTE 的节点列表 `ctes`
         op, ctes = sqlize(
             op,
             params=params,
+            # 应用 self.rewrites(该方言特定的重写规则,比如把某些 ibis 专属语义转换成 SQL 友好的形式)
             rewrites=self.rewrites,
+            # 应用 self.post_rewrites(重写之后的收尾处理规则)
             post_rewrites=self.post_rewrites,
+            # 根据 options.sql.fuse_selects 配置决定是否要"融合"连续的 select(减少嵌套子查询,生成更精简的 SQL)
             fuse_selects=options.sql.fuse_selects,
         )
-
+        # 记录每个关系节点(Relation)对应的别名(比如 t0、t1 或显式指定的别名)。
         aliases = {}
+        # 用来给没有显式别名的关系节点生成唯一的默认别名,如 t0, t1, t2...。
         counter = itertools.count()
-
+        # 第二阶段：定义翻译规则(递归遍历)
+        # 定义了一个闭包 fn，作为 op.map(fn) 的核心逻辑，按拓扑排序从叶子节点向根节点翻译：
+        # node:当前正在处理的 ibis 算子节点
         def fn(node, __unused__, **kwargs):
+            # # 调用 visit_node：根据 node 类型寻找对应的 visit_ 方法（如 visit_Selection）
             result = self.visit_node(node, **kwargs)
 
             # if it's not a relation then we don't need to do anything special
+            # 如果当前节点就是最顶层的根节点(node is op),或者当前节点根本不是一个"关系"类型的节点(比如它是一个标量值/列表达式,而非 select 语句这样的表格结构),
+            # 那么直接返回翻译结果,不需要做"打别名、包成子查询"这类特殊处理——因为别名/子查询包装只对"作为子查询嵌入到别的 select 中的关系节点"才有意义。
             if node is op or not isinstance(node, ops.Relation):
                 return result
 
             # alias ops.AliasedRelations to their explicitly assigned name otherwise generate
+            # 自动生成别名：SQL 语句中每个子查询都必须有别名 (t0, t1...)
             alias = (
                 node.name
                 if isinstance(node, ops.AliasedRelation)
                 else f"t{next(counter)}"
             )
             aliases[node] = alias
-
+            # 把字符串别名转换成一个正式的 sqlglot 标识符(Identifier)对象
             alias = sg.to_identifier(alias, quoted=self.quoted)
             if isinstance(result, sge.Subquery):
-                return result.as_(alias, quoted=self.quoted)
+                return result.as_(alias, quoted=self.quoted) # 将 result 包装为 (SELECT ...) AS tN
             else:
                 try:
                     return result.subquery(alias, copy=False)
@@ -669,27 +754,39 @@ class SQLGlotCompiler(abc.ABC):
                     )
 
         # apply translate rules in topological order
+        # 第三阶段：构建最终查询
+        # 1. 应用翻译规则：生成所有节点的 SQLGlot 表达式映射表
+        # 自底向上(先子节点后父节点)地对整棵表达式树的每一个节点调用 fn,并把每个节点对应的翻译结果收集到一个字典 results(key 是 op 节点,value 是对应的 sqlglot 表达式)里
         results = op.map(fn)
 
         # get the root node as a sqlglot select statement
+        # 2. 获取根节点结果，并清理（如果是表则转为 SELECT *，如果是子查询则拆解）
+        # 取出根节点 op 对应的翻译结果,这就是"最终 select 语句"的候选者。
         out = results[op]
         if isinstance(out, sge.Table):
             out = sg.select(STAR, copy=False).from_(out, copy=False)
         elif isinstance(out, sge.Subquery):
+            # 如果根节点被翻译成了一个 Subquery(即之前 fn 函数里给它套上了括号+别名的形式,
+            # 虽然对根节点这一层通常在 fn 里会被跳过打别名,但这里做个兜底),就把它"拆开",取出 .this(子查询内部真正的 select 语句),不需要保留最外层的括号包装和别名,
+            # 因为这是最终输出,不需要作为子查询嵌入到别的地方。
             out = out.this
-
+        # 3. 组装 CTE (WITH 子句)
         merged_ctes = []
+        # 遍历每一个 cte 节点,取出它对应的翻译结果 this。
+        # 如果这个结果本身已经带有 alias(说明前面 fn 函数已经给它包了一层别名/子查询),就取 .this 拿到里面真正的 select 语句本体,去掉多余的别名包装(因为 CTE 自己会单独指定别名)。
         for cte in ctes:
             this = results[cte]
             if "alias" in this.args:
                 this = this.this
+            # 处理别名逻辑，构建 SQLGlot 的 CTE 结构
             modified_cte = sge.CTE(
                 alias=sg.to_identifier(aliases[cte], quoted=self.quoted), this=this
             )
             merged_ctes.append(modified_cte)
         merged_ctes.extend(out.ctes)
         out.args.pop(WITH_ARG, None)
-
+        # 4. 合并 CTE 到主查询：使用 reduce 将所有 CTE 挂载到主查询的 WITH 子句中
+        # 用 reduce 把所有 merged_ctes 依次通过 .with_(...) 方法附加到 out 上,最终重建出一个包含全部 WITH cte1 AS (...), cte2 AS (...) SELECT ... 结构的完整 select 语句
         out = reduce(
             lambda parsed, cte: parsed.with_(
                 cte.args["alias"],
@@ -702,13 +799,18 @@ class SQLGlotCompiler(abc.ABC):
         )
 
         return out
-
+    # 根据传入的 ibis 算子节点(op)的具体类型,找到并调用对应的翻译规则方法,把该节点翻译成 sqlglot 表达式。
+    # 它本质上实现了一种"基于类型名字符串反射查找"的多态分发机制(类似手写的 single-dispatch)。
     def visit_node(self, op: ops.Node, **kwargs):
+        # 如果 op 是 ops.ScalarUDF(标量用户自定义函数,scalar user-defined function)的实例,直接调用固定的 self.visit_ScalarUDF(op, **kwargs) 方法来处理
         if isinstance(op, ops.ScalarUDF):
             return self.visit_ScalarUDF(op, **kwargs)
+        # 如果 op 是 ops.AggUDF(聚合类型的用户自定义函数,aggregate UDF)的实例,也做同样的特殊处理,统一路由到 self.visit_AggUDF(op, **kwargs)。
+        # 这是因为聚合 UDF 同样存在"类名是动态生成、无法一一枚举"的问题。
         elif isinstance(op, ops.AggUDF):
             return self.visit_AggUDF(op, **kwargs)
         else:
+            # 如果 op 既不是 ScalarUDF 也不是 AggUDF(也就是常规的、内置的 ibis 算子类型),就走通用的分发逻辑:
             method = getattr(self, f"visit_{type(op).__name__}", None)
             if method is not None:
                 return method(op, **kwargs)

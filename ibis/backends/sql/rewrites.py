@@ -346,7 +346,12 @@ def extract_ctes(node: ops.Relation) -> set[ops.Relation]:
 
     return result
 
-
+# 把 ibis 的表达式树"降级"(lower)成一个更接近 SQL 关系代数(relational algebra)的形式——也就是把 ibis 里那些比较高层、抽象的算子概念(比如 filter、project、sort 单独存在)转换成 SQL 里 select 语句真正拥有的结构(即一个 select 节点里同时带有投影、过滤、排序等属性),
+# 并识别出需要被提升为 CTE 的公共子表达式
+# node: ops.Node:待处理的 ibis 表达式树的根节点(通常是一个关系节点 Relation)。
+# rewrites: Sequence[Pattern] = ():在"SQL 特定转换"之前要应用的一组补充重写规则(通常是某个具体 SQL 方言/后端自定义的重写,比如把某个 ibis 算子转换成该方言支持的等价形式)。
+# post_rewrites: Sequence[Pattern] = ():在"SQL 特定转换"之后要应用的一组补充重写规则(用于收尾处理)。
+# fuse_selects: bool = True:是否要把连续多个 Select 节点合并/融合成一个(减少不必要的嵌套子查询,让生成的 SQL 更精简)。
 def sqlize(
     node: ops.Node,
     params: Mapping[ops.ScalarParameter, Any],
@@ -374,40 +379,59 @@ def sqlize(
     Tuple of the rewritten expression graph and a list of CTEs.
 
     """
+    # 传入的根节点必须是一个"关系"类型的节点(比如 select、join、表引用等),因为整个函数的目的就是处理关系代数层面的转换,如果传入的不是 Relation(比如传入了一个标量表达式),说明调用方用法有误。
     assert isinstance(node, ops.Relation)
 
     # apply the backend specific rewrites
+    # 如果调用方传入了非空的 rewrites 序列(某方言特有的重写规则),先把这些规则依次用 |(operator.or_)合并成一个统一的规则集合(在 ibis 的 pattern-matching 系统里,| 表示"规则组合",即匹配到任意一条就应用对应替换),
+    # 然后调用 node.replace(...) 对整棵表达式树做一次全局重写。这一步是"方言特定的前置处理",在真正做 SQL 化转换之前先处理掉那些该方言需要特殊对待的算子。
     if rewrites:
         node = node.replace(reduce(operator.or_, rewrites))
 
     # lower the expression graph to a SQL-like relational algebra
+    # 核心的"SQL 化"步骤,把一组固定的、内置的重写规则通过 | 全部合并成一个规则集合,对表达式树做一次统一的替换遍历。每条规则的作用(从命名可以推断):
     context = {"params": params}
     result = node.replace(
+        # 表达式树中的 ScalarParameter(标量参数占位符)节点,依据 context["params"] 替换成具体的字面量值。
         replace_parameter
+        # 去除多余的/冗余的别名包装节点,简化表达式树结构。
         | remove_aliases
+        # 把 ibis 的 Project(投影,选择列)算子转换成 SQL 的 Select 节点形式。
         | project_to_select
+        # 把 Filter(过滤,即 WHERE 条件)算子转换/合并进 Select 节点。
         | filter_to_select
+        # 把 Sort(排序,即 ORDER BY)算子转换/合并进 Select 节点。
         | sort_to_select
+        # 把 Distinct 算子转换成 Select 里的 DISTINCT 属性。
         | distinct_to_select
+        # 把"填充空值"(类似 fillna)的高层算子转换成用 Select + CASE WHEN(或 COALESCE)之类的形式表达。
         | fill_null_to_select
+        # 把"丢弃空值行"(类似 dropna)的算子转换成带有相应过滤条件的 Select。
         | drop_null_to_select
+        # 把"丢弃某些列"的算子转换成对应投影列表的 Select。
         | drop_columns_to_select
+        # 把某种"取第一个值"的聚合/窗口算子(First)转换成 SQL 标准或方言认可的 FIRST_VALUE 窗口函数形式。
         | first_to_firstvalue,
         context=context,
     )
 
     # squash subsequent Select nodes into one
+    # 如果 fuse_selects 为真(默认是),再应用一次 merge_select_select 规则,把表达式树中"连续嵌套的两个 Select 节点"尽可能合并成一个 Select(比如 SELECT a FROM (SELECT a, b FROM t WHERE ...)
+    # 这种可以合并简化的嵌套结构,合并后减少不必要的子查询嵌套层级,让最终 SQL 更简洁、执行效率也可能更好)。
     if fuse_selects:
         result = result.replace(merge_select_select)
-
+    # 如果调用方传入了非空的 post_rewrites,同样先用 | 合并成一个规则集合,再对 result 做一次替换。这是"SQL 化之后"的收尾重写,给各方言一个机会在标准转换流程跑完之后,再做一些额外的、针对性的调整。
     if post_rewrites:
         result = result.replace(reduce(operator.or_, post_rewrites))
 
     # extract common table expressions while wrapping them in a CTE node
+    # 调用 extract_ctes 函数,分析当前的表达式树,识别出哪些子表达式(子树)应该被提升成 CTE(即需要用 WITH name AS (...) 单独定义、
+    # 然后被多处引用的公共子查询——典型场景是同一个子查询被多次复用,或者显式要求生成 CTE 形式)。返回一个需要被视为 CTE 的节点集合/列表。
     ctes = extract_ctes(result)
 
     if ctes:
-
+        # 如果这个节点有需要更新的子节点(kwargs 里包含了子节点重写后的新值),
+        # 就用 __recreate__ 重新构造一个新的、内容更新过的同类型节点;否则保持 node 不变。
         def apply_ctes(node, kwargs):
             new = node.__recreate__(kwargs) if kwargs else node
             return CTE(new) if node in ctes else new

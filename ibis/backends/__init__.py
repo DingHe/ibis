@@ -90,8 +90,13 @@ class TablesAccessor(collections.abc.Mapping):
     def _ipython_key_completions_(self) -> list[str]:
         return self._backend.list_tables()
 
-
+# _FileIOHandler 是一个基类/混合类（Mixin），专门用于为各种后端（Backend）提供文件系统交互与数据格式转换的标准接口
+# 核心定位是 “数据进出 Ibis 的标准化枢纽”
+# 格式统一化：它将 Ibis 表达式执行的结果转换为常用的 Python 数据生态格式（如 pandas DataFrame、Polars DataFrame、PyArrow 表、PyTorch Tensor）
+# 文件读写能力：它定义了读取（read_...）和写入（to_...）常见数据格式（Parquet, CSV, JSON, Delta Lake）的通用协议。
+# 后端解耦：通过依赖 pyarrow 作为中间桥梁，使得不同数据库后端无需重复实现这些复杂的转换逻辑，只需实现基础的执行逻辑即可。
 class _FileIOHandler:
+    # 静态私有方法。负责动态导入 pyarrow 库
     @staticmethod
     def _import_pyarrow():
         try:
@@ -104,7 +109,8 @@ class _FileIOHandler:
             import pyarrow_hotfix  # noqa: F401
 
             return pyarrow
-
+    # 将 Ibis 表达式执行结果转为 pandas 的 DataFrame、Series 或标量。
+    # 直接包装了后端的 execute 方法
     def to_pandas(
         self,
         expr: ir.Expr,
@@ -133,7 +139,8 @@ class _FileIOHandler:
             Keyword arguments
         """
         return self.execute(expr, params=params, limit=limit, **kwargs)
-
+    # 以迭代器方式分批返回 pandas DataFrame
+    # 调用 to_pyarrow_batches 获取分批后的 Arrow 数据，再利用 PandasData.convert_table 将每批次转换为 pandas 格式。适用于超大数据集的内存优化处理。
     def to_pandas_batches(
         self,
         expr: ir.Expr,
@@ -898,7 +905,8 @@ class CacheEntry(NamedTuple):
     cached_op_ref: weakref.ref[ops.Relation]
     finalizer: weakref.finalize
 
-
+# 用于为后端（Backend）提供缓存管理能力。
+# 核心定位是 “Ibis 计算结果的生命周期管理器”
 class CacheHandler:
     """A mixin for handling `.cache()`/`CachedTable` operations."""
 
@@ -959,23 +967,31 @@ class CacheHandler:
     def _drop_cached_table(self, name: str) -> None:
         self.drop_table(name, force=True)
 
-
+# BaseBackend 是所有数据库后端（如 DuckDB, PostgreSQL, BigQuery, pandas 等）的核心抽象基类。
+# 它定义了 Ibis 统一查询接口的“契约”，确保用户无论底层连接的是什么数据库，都能使用相同的 Python API 进行数据操作
+# Ibis “Write Once, Run Anywhere”（一次编写，随处运行）架构的基石
+# 统一 API 规范：强制所有后端实现 table()、compile()、execute() 等标准方法
+# 混合能力集成：继承了 _FileIOHandler（处理数据导入导出）和 CacheHandler（处理结果缓存），具备了完整的数据生命周期管理能力。
+# 基础设施抽象：处理连接池生命周期、内存表（In-Memory Table）注册、UDF 注册以及 SQL 方言转换。
 class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
     """Base backend class.
 
     All Ibis backends must subclass this class and implement all the
     required methods.
     """
-
+    # 子类定义的后端唯一名称（如 "duckdb"）
     name: ClassVar[str]
-
+    # 标识该后端是否支持创建临时表
     supports_temporary_tables = False
+    # 标识该后端是否支持将 Python 函数作为 UDF 在数据库中执行。
     supports_python_udfs = False
-
+    # 初始化连接参数、内存表集合，并调用父类（Mixin）初始化
     def __init__(self, *args, **kwargs):
+        # 存储连接数据库所需的参数，用于序列化（__getstate__）和重新连接（reconnect）
         self._con_args: tuple[Any] = args
         self._con_kwargs: dict[str, Any] = kwargs
         self._can_reconnect: bool = True
+        # 用于追踪当前会话中注册的内存表，防止引用泄露。
         self._memtables = weakref.WeakSet()
         super().__init__()
 
@@ -1000,7 +1016,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         if not isinstance(other, self.__class__):
             return NotImplemented
         return self.db_identity == other.db_identity
-
+    # 计算属性，根据连接参数生成数据库的唯一标识（哈希值），用于去重判断。
     @functools.cached_property
     def db_identity(self) -> str:
         """Return the identity of the database.
@@ -1021,7 +1037,8 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         parts.extend(self._con_args)
         parts.extend(f"{k}={v}" for k, v in self._con_kwargs.items())
         return "_".join(map(str, parts))
-
+    # 类工厂方法
+    # 创建并返回一个新的后端实例，同时自动触发连接
     # TODO(kszucs): this should be a classmethod returning with a new backend
     # instance which does instantiate the connection
     def connect(self, *args, **kwargs) -> BaseBackend:
@@ -1051,15 +1068,15 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         new_backend = self.__class__(*args, **kwargs)
         new_backend.reconnect()
         return new_backend
-
+    # 负责断开数据库连接
     @abc.abstractmethod
     def disconnect(self) -> None:
         """Close the connection to the backend."""
-
+    # 用于在连接前对参数进行标准化或预处理
     @staticmethod
     def _convert_kwargs(kwargs: MutableMapping) -> None:
         """Manipulate keyword arguments to `.connect` method."""
-
+    # 使用缓存的 _con_args 和 _con_kwargs 重新执行 do_connect
     # TODO(kszucs): should call self.connect(*self._con_args, **self._con_kwargs)
     def reconnect(self) -> None:
         """Reconnect to the database already configured with connect."""
@@ -1067,7 +1084,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
             self.do_connect(*self._con_args, **self._con_kwargs)
         else:
             raise exc.IbisError("Cannot reconnect to unconfigured {self.name} backend")
-
+    # 后端子类必须实现此逻辑以建立物理连接
     def do_connect(self, *args, **kwargs) -> None:
         """Connect to database specified by `args` and `kwargs`."""
 
@@ -1100,7 +1117,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
 
         pattern = re.compile(like)
         return sorted(filter(pattern.findall, values))
-
+    # 获取数据库中的表列表，支持 like 正则过滤
     @abc.abstractmethod
     def list_tables(
         self, *, like: str | None = None, database: tuple[str, str] | str | None = None
@@ -1155,7 +1172,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         >>> con.list_tables(database="my_database")
         ['baz']
         """
-
+    # 返回一个 TablesAccessor，允许通过属性语法（con.tables.my_table）快速访问表。
     @abc.abstractmethod
     def table(
         self, name: str, /, *, database: tuple[str, str] | str | None = None
@@ -1223,7 +1240,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
 
         """
         return TablesAccessor(self)
-
+    # 返回后端引擎的版本字符串
     @property
     @abc.abstractmethod
     def version(self) -> str:
@@ -1240,7 +1257,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
             The backend version
 
         """
-
+    # 将该后端的自定义配置项注册到 ibis.config 中
     @classmethod
     def register_options(cls) -> None:
         """Register custom backend options."""
@@ -1255,7 +1272,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
                 setattr(options, backend_name, backend_options)
             except ValueError as e:
                 raise exc.BackendConfigurationNotRegistered(backend_name) from e
-
+    # 检查表达式中是否包含 Python UDF，并尝试在后端注册。
     def _register_udfs(self, expr: ir.Expr) -> None:
         """Register UDFs contained in `expr` with the backend."""
         if self.supports_python_udfs:
@@ -1270,7 +1287,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         ):
             raise exc.IbisError(f"Duplicate in-memory table names: {duplicate_names}")
         return memtables
-
+    # 扫描表达式中的临时内存表，并确保它们已上传至后端数据库。
     def _register_in_memory_tables(self, expr: ir.Expr) -> None:
         for memtable in self._verify_in_memory_tables_are_unique(expr):
             if memtable not in self._memtables:
@@ -1285,20 +1302,20 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
                             finalizer()
 
                     atexit.register(finalize)
-
+    # 子类需实现将内存数据（如 DataFrame）推送至数据库的逻辑。
     @abc.abstractmethod
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         """Register an in-memory table associated with `op`."""
-
+    # 生成清理临时表的闭包函数（与 atexit 配合使用）。
     @abc.abstractmethod
     def _make_memtable_finalizer(self, name: str) -> None | Callable[..., None]:
         """Make a finalizer for an in-memory table."""
-
+    # 在执行前自动处理内存表注册和 UDF 注入。
     def _run_pre_execute_hooks(self, expr: ir.Expr) -> None:
         """Backend-specific hooks to run before an expression is executed."""
         self._register_udfs(expr)
         self._register_in_memory_tables(expr)
-
+    # 将 Ibis 表达式转换为目标 SQL 字符串或 Polars LazyFrame
     @abc.abstractmethod
     def compile(
         self,
@@ -1323,7 +1340,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         kwargs
             Additional keyword arguments
         """
-
+    # 执行 Ibis 表达式并将结果拉取到本地 Python 环境中（返回 pandas 对象或标量）。
     def execute(
         self,
         expr: ir.Expr,
@@ -1347,7 +1364,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         kwargs
             Keyword arguments
         """
-
+    # 根据表达式或 schema 创建新表
     @abc.abstractmethod
     def create_table(
         self,
@@ -1386,7 +1403,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         Table
             The table that was created.
         """
-
+    # 删除表
     @abc.abstractmethod
     def drop_table(
         self,
@@ -1410,7 +1427,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         raise NotImplementedError(
             f'Backend "{self.name}" does not implement "drop_table"'
         )
-
+    # 重命名表
     def rename_table(self, old_name: str, new_name: str) -> None:
         """Rename an existing table.
 
@@ -1425,7 +1442,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         raise NotImplementedError(
             f'Backend "{self.name}" does not implement "rename_table"'
         )
-
+    # 视图的创建与销毁
     @abc.abstractmethod
     def create_view(
         self,
@@ -1455,7 +1472,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         ir.Table
             The view that was created.
         """
-
+    # 视图的创建与销毁
     @abc.abstractmethod
     def drop_view(
         self, name: str, /, *, database: str | None = None, force: bool = False
@@ -1471,7 +1488,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         force
             If `False`, an exception is raised if the view does not exist.
         """
-
+    # 检查该后端是否原生支持某种特定的 Ibis 操作（如数组索引、正则匹配）。
     @classmethod
     def has_operation(cls, operation: type[ops.Value], /) -> bool:
         """Return whether the backend implements support for `operation`.
@@ -1498,7 +1515,7 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
         raise NotImplementedError(
             f"{cls.name} backend has not implemented `has_operation` API"
         )
-
+    # 利用 sqlglot 将一种 SQL 方言转换为当前后端的方言。
     def _transpile_sql(self, query: str, *, dialect: str | None = None) -> str:
         # only transpile if dialect was passed
         if dialect is None:
@@ -1515,10 +1532,10 @@ class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
             (query,) = sg.transpile(query, read=dialect, write=output_dialect)
         return query
 
-
+# 设计目的是为 Ibis 的集成测试或示例演示提供一种标准化的、高效的数据摄入机制，支持从本地文件直接读取数据到数据库后端。
 class BaseExampleLoader(abc.ABC):
     __slots__ = ()
-
+    # 模板方法（Template Method）模式的应用，通过判断文件后缀自动分发加载任务
     @abc.abstractmethod
     def _load_example(self, *, path: str | Path, table_name: str) -> ir.Table:
         # Read directly into these backends. This helps reduce memory

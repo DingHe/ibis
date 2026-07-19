@@ -80,7 +80,13 @@ def metadata_row_to_type(
         typ = type_mapper.from_string(type_string, nullable=nullable)
     return typ
 
-
+# Ibis 项目中用于对接 Oracle 数据库的后端实现 (ibis.backends.oracle)。
+# 通过 Python 的 oracledb 驱动，将 Ibis 的延迟计算表达式（Expression）转换为 Oracle 可执行的 SQL，并处理数据类型映射、元数据查询及表管理等操作。
+# 主要作用包括：
+# 连接管理：封装 oracledb 连接，支持通过主机、端口、SID 或服务名 (Service Name) 进行连接。
+# SQL 编译与执行：利用 sqlglot 将 Ibis 表达式翻译为 Oracle 方言的 SQL 语句。
+# 元数据映射：将 Oracle 的系统表（如 all_tab_columns）信息转化为 Ibis 的 Schema 类型系统。
+# 生命周期管理：处理临时表创建、数据内存上传、事务控制（Commit/Rollback）以及资源清理。
 class Backend(
     SQLBackend,
     CanListDatabase,
@@ -88,15 +94,19 @@ class Backend(
     HasCurrentCatalog,
     PyArrowExampleLoader,
 ):
+    # 标识当前后端为 oracle
     name = "oracle"
+    # 指定 Oracle 专用的 SQL 编译器逻辑
     compiler = sc.oracle.compiler
+    # 声明该后端支持临时表操作
     supports_temporary_tables = True
 
     @cached_property
     def version(self):
         matched = re.search(r"(\d+)\.(\d+)\.(\d+)", self.con.version)
         return ".".join(matched.groups())
-
+    # 标准连接入口。
+    # 负责验证参数（SID 与 Service Name 互斥），构建 DSN，初始化 oracledb 连接，并设置 stmtcachesize=0（防止预编译语句重用导致的类型错误）。
     def do_connect(
         self,
         *,
@@ -193,7 +203,7 @@ class Backend(
         self.con = oracledb.connect(dsn, user=user, password=password, stmtcachesize=0)
 
         self._post_connect()
-
+    # 允许用户传入一个现有的 oracledb 连接对象来创建一个 Ibis 后端实例。
     @util.experimental
     @classmethod
     def from_connection(cls, con: oracledb.Connection, /) -> Backend:
@@ -209,7 +219,8 @@ class Backend(
         new_backend.con = con
         new_backend._post_connect()
         return new_backend
-
+    # 连接建立后的钩子函数。
+    # 设置 oracledb.defaults.fetch_decimals = True，确保 Oracle 的 NUMBER 类型能正确映射为 Python 的 Decimal。
     def _post_connect(self) -> None:
         # turn on autocommit
         # TODO: it would be great if this worked but it doesn't seem to do the trick
@@ -218,7 +229,7 @@ class Backend(
 
         # Set to ensure decimals come back as decimals
         oracledb.defaults.fetch_decimals = True
-
+    # 用于解析连接字符串（如 oracle://user:pass@host:port/db）并将其转化为连接参数。
     def _from_url(self, url: ParseResult, **kwarg_overrides):
         kwargs = {}
         if url.username:
@@ -248,7 +259,7 @@ class Backend(
         with self._safe_raw_sql(sg.select("user").from_("dual")) as cur:
             [(database,)] = cur.fetchall()
         return database
-
+    # 开启事务，执行成功后自动 commit，发生异常时自动 rollback，最后关闭游标。
     @contextlib.contextmanager
     def begin(self):
         con = self.con
@@ -262,12 +273,12 @@ class Backend(
             con.commit()
         finally:
             cur.close()
-
+    # 封装了 raw_sql 的上下文管理器，确保执行后的资源被正确关闭。
     @contextlib.contextmanager
     def _safe_raw_sql(self, *args, **kwargs):
         with contextlib.closing(self.raw_sql(*args, **kwargs)) as result:
             yield result
-
+    # 直接执行 SQL。支持传入字符串或 sqlglot 表达式，并自动处理 Oracle 的事务提交。
     def raw_sql(self, query: str | sg.Expression, **kwargs: Any) -> Any:
         with contextlib.suppress(AttributeError):
             query = query.sql(dialect=self.name)
