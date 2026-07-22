@@ -247,43 +247,62 @@ class Comparable(Abstract):
             if not eqs2:
                 del self.__cache__[id2]
 
-
+# SlottedMeta 元类是用来自动化管理与继承类字段（Fields）与槽（Slots）定义的核心机制。
+# 在创建类（Class Creation Phase）时，自动向上递归收集所有父类的字段/槽定义（__fields__ 或 __slots__），并将它们与当前类自身定义的字段合并，最终在类上生成一个完整的 __fields__ 元组。
+# 解决继承下的属性字段收集问题：在复杂的类继承树中（如 Ibis 内部各种复杂的 IR 节点继承链），每个派生类可能都会新增或重写字段。SlottedMeta 能够确保每一个子类都能无缝感知到从所有父类继承来的全量属性字段。
+# 配合内存与底层属性映射：为 Ibis 内部的对象（如 Node、Value 等结构）提供统一的元数据检索，方便属性访问校验、序列化、复制以及模式匹配等操作。
 class SlottedMeta(AbstractMeta):
+    # metacls：当前的元类本身（即 SlottedMeta）。
+    # clsname：正在被创建的类的名字（字符串，如 "MyRelationNode"）。
+    # bases：正在被创建的类的直接父类元组（tuple）。
+    # dct：类的属性与方法字典（包含了类定义体中写的所有变量与函数）。
+    # **kwargs：创建类时传递的其他关键字参数（如 Python 3 中的 class MyClass(metaclass=SlottedMeta, kw=value):）。
     def __new__(metacls, clsname, bases, dct, **kwargs):
+        # 获取当前正在创建的类自身定义的字段/槽。
         fields = dct.get("__fields__", dct.get("__slots__", ()))
+        # 获取所有直接父类中已积累的 __fields__ 字段。
         inherited = (getattr(base, "__fields__", ()) for base in bases)
+        # 合并父类继承的字段与当前类定义的字段，并更新类字典。
         dct["__fields__"] = sum(inherited, ()) + fields
         return super().__new__(metacls, clsname, bases, dct, **kwargs)
 
-
+# Slotted 是 Ibis 内部定义的一个轻量级底层数据类（Data Class）基类。
+# 减少样板代码（Boilerplate Reduction）：它是 ibis.common.grounds.Annotable 的轻量化替代品。
+# 子类只需声明字段名称（通过 __fields__ 或 __slots__），Slotted 就能自动为你生成初始化（__init__）、相等性比较（__eq__）、状态序列化/反序列化（__getstate__/__setstate__）以及可读的字符串输出（__repr__）。
+# 结合 SlottedMeta 实现字段自动收集：因为它的元类是 SlottedMeta，继承 Slotted 的子类会自动获得从所有父类递归拼接而来的 __fields__ 清单。
+# 基于槽的性能与规范优化：通过限制实例属性必须在 __fields__ 内，避免了常规类字典开销，便于进行高速的属性存取和对象复制。
 class Slotted(Abstract, metaclass=SlottedMeta):
     """A lightweight alternative to `ibis.common.grounds.Annotable`.
 
     The class is mostly used to reduce boilerplate code.
     """
-
+    # 记录当前类及其所有父类所拥有的全量属性字段名称。
+    # Slotted 中的所有魔法方法（如构造函数、比较、序列化）都是完全依赖 __fields__ 中列出的字段名来驱动的。
     __fields__: tuple[str, ...]
-
+    # 根据传入的关键字参数，自动初始化对象在 __fields__ 中定义的所有属性。
     def __init__(self, **kwargs) -> None:
+        # 遍历 self.__fields__ 中的每一个字段名 field。
+        # 调用底层 object.__setattr__(self, field, kwargs[field]) 将 kwargs 中对应的值绑定到实例上。
         for field in self.__fields__:
+            # 使用 object.__setattr__ 可以绕过子类可能重写的 __setattr__ 限制（例如只读属性控制）。
             object.__setattr__(self, field, kwargs[field])
-
+    # 判断当前对象与另一个对象在逻辑上是否完全相等
     def __eq__(self, other) -> bool:
         if self is other:
             return True
         if type(self) is not type(other):
             return NotImplemented
         return all(getattr(self, n) == getattr(other, n) for n in self.__fields__)
-
+    # 显式将该类的对象标记为不可哈希（Unhashable）。
     __hash__ = None
-
+    # 导出实例的状态字典，用于对象序列化（如 pickle 或深拷贝 deepcopy）。
     def __getstate__(self) -> dict[str, Any]:
         return {k: getattr(self, k) for k in self.__fields__}
-
+    # 根据传入的状态字典还原实例的属性状态。
     def __setstate__(self, state) -> None:
         for name, value in state.items():
             object.__setattr__(self, name, value)
-
+    # 生成可读性良好的对象开发者字符串表示。
     def __repr__(self) -> str:
         fields = {k: getattr(self, k) for k in self.__fields__}
         fieldstring = ", ".join(f"{k}={v!r}" for k, v in fields.items())
