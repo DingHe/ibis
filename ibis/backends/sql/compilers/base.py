@@ -514,7 +514,7 @@ class SQLGlotCompiler(abc.ABC):
                     self, _, *, _name: str = target_name, where, order_by=(), **kw
                 ):
                     return self.agg[_name](*kw.values(), where=where, order_by=order_by)
-            # # 普通函数调用（如 ABS/LENGTH）
+            # 普通函数调用（如 ABS/LENGTH）
             else:
 
                 def impl(self, _, *, _name: str = target_name, **kw):

@@ -29,62 +29,75 @@ if TYPE_CHECKING:
 x = var("x")
 y = var("y")
 
-
+# rewrites.py 的核心作用是：将高层的抽象表达式树“降级”并重写为结构上接近 SQL 关系代数的中间表达（Lowering to SQL-like Relational Algebra）。
+# 主要完成以下 4 个任务：
+# 算子规范化：将抽象算子（如 Project, Filter, Sort 等）统一收拢为类似于 SQL SELECT 结构（Select 节点）。
+# Select 节点融合 (Select Fusion)：尽可能将多层嵌套的 Select 节点合并为一个，消除不必要的子查询嵌套（如把 SELECT a FROM (SELECT a, b FROM t WHERE ...) 融合成单个 SELECT）。
+# 公共子表达式 (CTE) 提取：识别在树中被多次引用的子查询或复杂的节点，将其提出来标记为 CTE（WITH cte AS (...)）。
+# 后端通用降级 (Lowering Rules)：提供一系列通用的重写规则，例如将 1-based 索引转为 0-based、将 log2(x) 转换为 log(x, base=2)、将 Capitalize 转为 upper + lower + substring 等。
+# 表示 SQL 中的公共子表达式（Common Table Expression, WITH 语句）
 @public
 class CTE(ops.Relation):
     """Common table expression."""
-
+    # parent: ops.Relation：产生该 CTE 的底层关系节点（即 WITH cte_name AS (parent) 中的 parent）。
     parent: ops.Relation
 
+    # schema (装饰器 @attribute)：返回该 CTE 的 Schema（列名与类型），直接继承自 parent.schema。
     @attribute
     def schema(self):
         return self.parent.schema
-
+    # values (装饰器 @attribute)：返回该 CTE 输出的字段值映射，继承自 parent.values。
     @attribute
     def values(self):
         return self.parent.values
 
-
+# Ibis 关系代数的核心节点，建模对应 SQL 的 SELECT 结构。它将投影、过滤、排序等操作合并在一起。
 @public
 class Select(ops.Relation):
     """Relation modelled after SQL's SELECT statement."""
-
+    # 数据源表或子查询。
     parent: ops.Relation
+    # 选择/投影的列（对应 SELECT a, b AS c）。
     selections: FrozenDict[str, ops.Value] = {}
+    # 普通的过滤条件（对应 WHERE）。
     predicates: VarTuple[ops.Value[dt.Boolean]] = ()
+    # 包含窗口函数等限定条件（对应 QUALIFY 或子查询过滤）。
     qualified: VarTuple[ops.Value[dt.Boolean]] = ()
+    # 排序键（对应 ORDER BY）
     sort_keys: VarTuple[ops.SortKey] = ()
+    # 是否去重（对应 DISTINCT）
     distinct: bool = False
 
+    # 判断当前的选列是否等价于 SELECT *（即选择的列及其顺序与父节点 parent.fields 完全一致）
     def is_star_selection(self):
         return tuple(self.values.items()) == tuple(self.parent.fields.items())
-
+    # values (装饰器 @attribute)：返回选择的列集合（即 self.selections）。
     @attribute
     def values(self):
         return self.selections
-
+    # 根据当前选中的列及其类型计算并返回生成的 Schema。
     @attribute
     def schema(self):
         return Schema({k: v.dtype for k, v in self.selections.items()})
 
-
+# 分析/窗口函数，表示获取分组或窗口中的第一个值（对应 SQL 的 FIRST_VALUE）。
 @public
 class FirstValue(ops.Analytic):
     """Retrieve the first element."""
-
+    # 传入的目标列。
     arg: ops.Column[dt.Any]
-
+    # 推导输出的数据类型，与 arg.dtype 相同
     @attribute
     def dtype(self):
         return self.arg.dtype
 
-
+# 分析/窗口函数，表示获取分组或窗口中的最后一个值（对应 SQL 的 LAST_VALUE）。
 @public
 class LastValue(ops.Analytic):
     """Retrieve the last element."""
-
+    # 传入的目标列。
     arg: ops.Column[dt.Any]
-
+    # 推导输出的数据类型，与 arg.dtype 相同
     @attribute
     def dtype(self):
         return self.arg.dtype

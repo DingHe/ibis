@@ -31,22 +31,30 @@ T = TypeVar("T")
 Unaliased = Annotated[T, ~InstanceOf(Alias)]
 NonSortKey = Annotated[T, ~InstanceOf(SortKey)]
 
+# Relation 是 Ibis 内部定义所有关系型操作（Relational Operations）的抽象基类。
+# 表达式图的核心节点：Ibis 的架构分为 API 层（Table 表达式）和内部 IR 层（Operation/Node 节点）。Relation 继承自 Node，代表表达式 IR（中间表示）图中的一个表级（Table-level）节点。例如：Selection（过滤/投影）、Join（连接）、Aggregate（聚合）等底层操作都是 Relation 的子类。
+# 连接 API 与底层 IR 的桥梁：它实现了 Coercible 接口，负责在内部 IR 节点和用户直接调用的 Table API 表达式之间进行平滑转换。
+# 元数据与结构约束：它强制要求所有派生的关系节点都必须具备明确的模式（Schema）以及列表达式映射（values），保证了查询构建过程中的类型安全和编译正确性。
 
 @public
 class Relation(Node, Coercible):
     """Base class for relational operations."""
-
+    # 类型强制转换方法。将输入的各种对象统一转换为 Relation 操作节点。
     @classmethod
     def __coerce__(cls, value):
         from ibis.expr.types import Table
-
+        # 如果 value 本身已经是 Relation 实例，则直接返回；
         if isinstance(value, Relation):
             return value
+        # 如果 value 是高层 API 的 Table 实例，通过调用 value.op() 获取其底层的 IR 操作节点（即 Relation 对象）并返回；
         elif isinstance(value, Table):
             return value.op()
         else:
             raise TypeError(f"Cannot coerce {value!r} to a Relation")
-
+    # 表示该关系节点包含的列名与其计算表达式之间的映射关系。
+    # Ibis 进行表达式重写（Query Rewriting）和优化的核心属性。
+    # 在底层引擎生成 SQL 或执行计划时，
+    # 需要通过 values 明确知道这一层关系操作中每一列是如何算出来的（例如是直接引用父节点的列，还是经过了某些标量运算或聚合计算）。
     @property
     @abstractmethod
     def values(self) -> FrozenOrderedDict[str, Value]:
@@ -56,7 +64,7 @@ class Relation(Node, Coercible):
         dereferencing in the API layer. The returned expressions must only
         originate from parent relations, depending on the relation type.
         """
-
+    # 定义该关系输出结果的结构模式（即包含哪些列以及每列的数据类型）
     @property
     @abstractmethod
     def schema(self) -> Schema:
@@ -65,7 +73,7 @@ class Relation(Node, Coercible):
         All relations must have a well-defined schema.
         """
         ...
-
+    # 获取该关系暴露出的所有列字段对象（Column）
     @property
     def fields(self) -> FrozenOrderedDict[str, Column]:
         """A mapping of column names to fields of the relation.
@@ -74,7 +82,8 @@ class Relation(Node, Coercible):
         is mostly used for convenience.
         """
         return FrozenOrderedDict({k: Field(self, k) for k in self.schema})
-
+    # 普通实例方法
+    # 返回值：Table（Ibis API 层的表表达式对象）
     def to_expr(self):
         from ibis.expr.types import Table
 

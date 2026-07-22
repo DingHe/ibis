@@ -58,7 +58,11 @@ def as_resolver(obj):
 class NoMatch(metaclass=Sentinel):
     """Marker to indicate that a pattern didn't match."""
 
-
+# Ibis 类型校验、类型转换（Coercion）以及节点模式匹配（Pattern Matching/IR Rewriting） 系统的底层基石
+# Pattern 是所有模式对象的抽象基类，主要承担三大核心职责：
+# 类型校验与自动化转换：在构建 Ibis 表达式或节点（Node）时，系统需要校验用户传入的参数类型。Pattern 负责验证数据是否符合预期形态，并在必要时自动调用强制转换（Coercion）。
+# 表达式图的模式匹配与重写（IR Rewriting）：Ibis 的编译器会对表达式树（IR）进行结构分析与优化。Pattern 提供了针对表达式树进行结构匹配、捕获（Capture）和替换（Replace）的能力。
+# 基于 Python Typehint 快速构建规则：内置强大的元编程解析逻辑（from_typehint），能够将 Python 原生的类型注解（如 Union、Annotated、Tuple 等）自动转换为内部对应的 Pattern 验证器。
 # TODO(kszucs): have an As[int] or Coerced[int] type in ibis.common.typing which
 # would be used to annotate an argument as coercible to int or to a certain type
 # without needing for the type to inherit from Coercible
@@ -68,7 +72,12 @@ class Pattern(Hashable):
     Patterns are used to match values against a given condition. They are extensively
     used by other core components of Ibis to validate and/or coerce user inputs.
     """
-
+    # 解析 Python 标准类型注解（Typehint），将其递归映射并构造为对应的 Ibis Pattern 验证对象。
+    # 主要任务是将 Python 原生的各种类型注解（Typehint）拆解，递归翻译为 Ibis 内部的 Pattern 校验/强转对象。
+    # annot：被解析的类型注解（如 int, Optional[str], Annotated[int, Positive] 等）
+    # 例如 name: str = "Alice"，这里的str就是类型注解
+    # tags: list[str] = ["python", "ibis", "sql"]  list[str】也是
+    # allow_coercion：布尔值，标识是否允许自动类型强转（若为 True，遇到实现 Coercible 协议的类型时会返回强转模式 CoercedTo，而非单纯的类型检查 InstanceOf）。
     @classmethod
     def from_typehint(cls, annot: type, allow_coercion: bool = True) -> Pattern:
         """Construct a validator from a python type annotation.
@@ -88,21 +97,31 @@ class Pattern(Hashable):
         """
         # TODO(kszucs): cache the result of this function
         # TODO(kszucs): explore issubclass(typ, SupportsInt) etc.
+        # 利用 Python typing 模块的底层函数提取泛型的“原始类型”（origin）与“泛型参数列表”（args）。
+        # 示例：对于 list[int]，origin 是 list，args 是 (int,)。
+        # 示例：对于非泛型 int，origin 为 None，args 为 ()。
         origin, args = get_origin(annot), get_args(annot)
-
+        # 分支一：非泛型类型处理（origin is None
         if origin is None:
             # the typehint is not generic
+            # 如果注解是 ...（Ellipsis）或者 Any（通配类型），直接返回匹配任意值的通配符模式 _any。
             if annot is Ellipsis or annot is AnyType:
                 # treat both `Any` and `...` as wildcard
                 return _any
+            # 如果注解是一个具体的 Python 类（如 int、str 或 Ibis 自定义类 Table）
             elif isinstance(annot, type):
                 # the typehint is a concrete type (e.g. int, str, etc.)
+                # 若开启了 allow_coercion 且该类实现了 Coercible 强转协议，返回 CoercedTo(annot)（尝试强转）；
                 if allow_coercion and issubclass(annot, Coercible):
                     # the type implements the Coercible protocol so we try to
                     # coerce the value to the given type rather than checking
                     return CoercedTo(annot)
                 else:
+                    # 否则返回 InstanceOf(annot)（仅做 isinstance 校验）。
                     return InstanceOf(annot)
+            # 处理泛型类型变量 TypeVar（例如 T = TypeVar("T", bound=int)）：
+            # 检查是否为协变（covariant），非协变目前抛出未实现异常；
+            # 如果 TypeVar 指定了上界 bound（如绑定为 int），递归调用自身解析上界类型；否则返回通配符 _any。
             elif isinstance(annot, TypeVar):
                 # if the typehint is a type variable we try to construct a
                 # validator from it only if it is covariant and has a bound
@@ -114,9 +133,11 @@ class Pattern(Hashable):
                     return cls.from_typehint(annot.__bound__)
                 else:
                     return _any
+            # 如果注解是 Enum 字段，返回要求值必须等于该枚举对象的 EqualTo 模式。
             elif isinstance(annot, Enum):
                 # for enums we check the value against the enum values
                 return EqualTo(annot)
+            # 处理字符串形式的类型声明（如 'Table'）或前向引用 ForwardRef。生成 LazyInstanceOf 模式，在运行时再延迟查找对应的类。
             elif isinstance(annot, str):
                 # for strings and forward references we check in a lazy way
                 return LazyInstanceOf(annot)
@@ -124,36 +145,48 @@ class Pattern(Hashable):
                 return LazyInstanceOf(annot.__forward_arg__)
             else:
                 raise TypeError(f"Cannot create validator from annotation {annot!r}")
+        # 分支二：各种高级泛型类型处理（origin is not None）
+        # 若显式注解了 CoercedTo[T]，直接提取内部第一个参数生成 CoercedTo 模式。
         elif origin is CoercedTo:
             return CoercedTo(args[0])
+        # 处理字面量枚举（如 Literal["a", "b"]），返回 IsIn(args) 模式，校验输入值是否在指定的集合列表中。
         elif origin is Literal:
             # for literal types we check the value against the literal values
             return IsIn(args)
+        # 联合类型：Union 与 Optional
         elif origin is UnionType or origin is Union:
             # this is slightly more complicated because we need to handle
             # Optional[T] which is Union[T, None] and Union[T1, T2, ...]
+            # 拆解参数 args。如果最后一个参数是 type(None)（即 NoneType），说明它是一个 Optional[...]：
             *rest, last = args
             if last is type(None):
                 # the typehint is Optional[*rest] which is equivalent to
                 # Union[*rest, None], so we construct an Option pattern
+                # 提取非空类型并递归解析为 inner 模式，最终外层包装为 Option(inner) 模式（允许为 None）。
                 if len(rest) == 1:
                     inner = cls.from_typehint(rest[0])
+                # 若不是 Optional，则将所有联合分支类型递归解析，包装为多选一模式 AnyOf。
                 else:
                     inner = AnyOf(*map(cls.from_typehint, rest))
                 return Option(inner)
             else:
                 # the typehint is Union[*args] so we construct an AnyOf pattern
                 return AnyOf(*map(cls.from_typehint, args))
+        # 附加元数据：Annotated
+        # 第一个参数 annot 是基础类型，其余参数 extras 是附加约束；
         elif origin is Annotated:
             # the Annotated typehint can be used to add extra validation logic
             # to the typehint, e.g. Annotated[int, Positive], the first argument
             # is used for isinstance checks, the rest are applied in conjunction
             annot, *extras = args
+            # 递归解析 annot 并与 extras 组合，返回必须同时满足的 AllOf 模式。
             return AllOf(cls.from_typehint(annot), *extras)
+        # 可调用对象：Callable
         elif origin is Callable:
             # the Callable typehint is used to annotate functions, e.g. the
             # following typehint annotates a function that takes two integers
             # and returns a string: Callable[[int, int], str]
+            # 若带签名参数（如 Callable[[int], str]），提取参数列表和返回值，分别递归解析为模式，构造 CallableWith 模式；
             if args:
                 # callable with args and return typehints construct a special
                 # CallableWith validator
@@ -164,19 +197,26 @@ class Pattern(Hashable):
             else:
                 # in case of Callable without args we check for the Callable
                 # protocol only
+                # 若未指定签名（如单纯的 Callable），只做 InstanceOf(Callable) 校验。
                 return InstanceOf(Callable)
+        # 处理 tuple 注解：
         elif issubclass(origin, tuple):
             # construct validators for the tuple elements, but need to treat
             # variadic tuples differently, e.g. tuple[int, ...] is a variadic
             # tuple of integers, while tuple[int] is a tuple with a single int
+            # 变长元组（如 tuple[int, ...]）：rest 匹配到 Ellipsis，解析 first 类型并构造 TupleOf 模式；
             first, *rest = args
             if rest == [Ellipsis]:
                 return TupleOf(cls.from_typehint(first))
             else:
+                # 定长元组（如 tuple[int, str]）：将每个位置的类型分别解析，构造定长列表模式 PatternList。
                 return PatternList(map(cls.from_typehint, args), type=origin)
+        # 序列与字典：Sequence & Mapping
+        # 处理列表、序列类容器（如 Sequence[int] 或 list[str]）：
         elif issubclass(origin, Sequence):
             # construct a validator for the sequence elements where all elements
             # must be of the same type, e.g. Sequence[int] is a sequence of ints
+            # 解析内部元素类型 value_inner；
             (value_inner,) = map(cls.from_typehint, args)
             if allow_coercion and issubclass(origin, Coercible):
                 return GenericSequenceOf(value_inner, type=origin)
@@ -187,6 +227,8 @@ class Pattern(Hashable):
             # Mapping[str, int] is a mapping with string keys and int values
             key_inner, value_inner = map(cls.from_typehint, args)
             return MappingOf(key_inner, value_inner, type=origin)
+        # 通用泛型类：GenericMeta
+        # 根据强转许可与 Coercible 判定，返回对应的 GenericCoercedTo 或 GenericInstanceOf。
         elif isinstance(origin, GenericMeta):
             # construct a validator for the generic type, see the specific
             # Generic* validators for more details
@@ -198,7 +240,13 @@ class Pattern(Hashable):
             raise TypeError(
                 f"Cannot create validator from annotation {annot!r} {origin!r}"
             )
-
+    # Pattern 自身是一个抽象基类，不直接执行具体的匹配逻辑。所有继承 Pattern 的子类（如 InstanceOf、AnyOf、CoercedTo、SequenceOf 等）必须实现并重写此方法。
+    # value: AnyType 待匹配、校验或强转的具体数值或对象。
+    # 基础数据/Python 对象：例如 123、"hello"、[1, 2, 3] 等。
+    # Ibis IR 表达式节点：例如 Literal 节点、Column 节点、或者整个操作节点 Node（在进行 IR 树重写和模式匹配时）。
+    # context: dict[str, AnyType] 匹配过程中共享的上下文状态字典（Context Dictionary）
+    # 变量捕获（Capture）：当模式中包含捕获表达式（例如 "x" @ PatternA）时，匹配成功的 value 会以键名 "x" 保存到 context 字典中，供后续的重写逻辑或谓词检查使用。
+    # 跨节点状态共享：在递归匹配复杂的深层数据结构（如嵌套列表或 IR 语法树）时，context 作为“记忆库”在各个节点的 match 方法之间传递。
     @abstractmethod
     def match(self, value: AnyType, context: dict[str, AnyType]) -> AnyType:
         """Match a value against the pattern.
@@ -217,20 +265,26 @@ class Pattern(Hashable):
 
         """
         ...
-
+    # 生成当前 Pattern 的可读文本描述（通常用于生成清晰的报错信息或调试日志）。
     def describe(self, plural=False):
         return f"matching {self!r}"
-
+    # 判断两个 Pattern 对象在逻辑上是否等价。
+    # 由于子类需要被缓存或进行去重比对，子类必须实现此相等性判断。
     @abstractmethod
     def __eq__(self, other: Pattern) -> bool: ...
-
+    # 获取 Pattern 对象的哈希值。
+    # 搭配基类声明的 Hashable 接口，确保 Pattern 实例可以作为字典的键（Key）或存入集合（Set）中。
     @abstractmethod
     def __hash__(self) -> int: ...
-
+    # 魔法方法（重载取反运算符 ~）
+    # 生成取反模式（逻辑非）。
+    # 用法示例：~PatternA 会返回一个 Not(PatternA) 实例，匹配所有不符合 PatternA 的值。
     def __invert__(self) -> Not:
         """Syntax sugar for matching the inverse of the pattern."""
         return Not(self)
-
+    # 魔法方法（重载位或运算符 |）
+    # 生成析取模式（逻辑或）。
+    # 用法示例：PatternA | PatternB 会返回一个 AnyOf(PatternA, PatternB) 实例，值只需满足其中任意一个模式即可匹配。
     def __or__(self, other: Pattern) -> AnyOf:
         """Syntax sugar for matching either of the patterns.
 
@@ -245,7 +299,9 @@ class Pattern(Hashable):
 
         """
         return AnyOf(self, other)
-
+    # 魔法方法（重载位与运算符 &）
+    # 生成合取模式（逻辑与）。
+    # PatternA & PatternB 会返回一个 AllOf(PatternA, PatternB) 实例，值必须同时满足这两个模式。
     def __and__(self, other: Pattern) -> AllOf:
         """Syntax sugar for matching both of the patterns.
 
@@ -260,7 +316,9 @@ class Pattern(Hashable):
 
         """
         return AllOf(self, other)
-
+    # 魔法方法（重载右移运算符 >>）
+    # 语法糖，构建“匹配并替换”操作。
+    # 用法示例：PatternA >> deferred_func 会返回 Replace(PatternA, deferred_func)。当 PatternA 匹配成功时，将值替换为计算后的新值，常用于 IR 树重写。
     def __rshift__(self, other: Deferred) -> Replace:
         """Syntax sugar for replacing a value.
 
@@ -275,7 +333,9 @@ class Pattern(Hashable):
 
         """
         return Replace(self, other)
-
+    # 魔法方法（重载反向 @ 运算符）
+    # 语法糖，给模式绑定标识符名称，将匹配到的对象“捕获”到上下文中。
+    # 用法示例："x" @ PatternA 触发 PatternA.__rmatmul__("x")，返回 Capture("x", PatternA)，匹配成功后将匹配值以键 "x" 存入 context。
     def __rmatmul__(self, name: str) -> Capture:
         """Syntax sugar for capturing a value.
 
@@ -290,7 +350,8 @@ class Pattern(Hashable):
 
         """
         return Capture(name, self)
-
+    # 魔法方法（重载迭代接口 iter()）
+    # 生成可重复匹配的序列子模式（SomeOf）。
     def __iter__(self) -> SomeOf:
         yield SomeOf(self)
 
