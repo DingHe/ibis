@@ -111,46 +111,76 @@ _geotypes = {
     "MULTIPOLYGON": dt.MultiPolygon,
 }
 
-
+# SqlglotType 类继承TypeMapper（即 TypeMapper[sge.DataType]），是 Ibis 项目中专门基于 Sqlglot 库实现的底层类型转换基类。
+# SQL 语法在不同的数据库（如 Postgres、Snowflake、DuckDB、ClickHouse 等）之间存在很大差异。Ibis 借由 Sqlglot 提供的强 SQL 解析能力，将 Ibis 数据类型 与 Sqlglot 的抽象语法树（AST）数据类型 sge.DataType 关联起来，从而实现各种 SQL 方言类型的大一统。
+# 类型双向桥接（Ibis ↔ Sqlglot）：
+# 将 Sqlglot 的表达式类型对象（sge.DataType）转换为统一的 Ibis dt.DataType。
+# 反向将 Ibis dt.DataType 转回 Sqlglot 的 sge.DataType，方便编译出目标数据库的 SQL。
+# 多方言（Dialect）特定逻辑适配：
+# 通过设置 dialect 属性，让不同数据库子类（如 PostgresType、DuckDBType）能够处理特定的语法规范（如缺省精度、时区支持、可空性等）。
+# 分发与映射驱动引擎：
+# 采用基于动态方法派发（Dynamic Dispatch）的方式，
+# 根据类型的名字模式（如 _from_sqlglot_VARCHAR 或 _from_ibis_String）将复杂的泛型、复合类型（Array、Map、Struct 等）精确路由至专属处理函数。
 class SqlglotType(TypeMapper):
+    # 指定当前解析器对应的 SQL 方言名称（如 "postgres"、"duckdb" 等）。影响 from_string 的解析行为以及 to_string 生成 SQL 时的语法规范。
     dialect: str | None = None
     """The dialect this parser is for."""
-
+    # 当类型定义未显式声明是否允许 NULL 时（例如在 DDL 中未写 NOT NULL），使用的默认可空性（默认为 True）。
     default_nullable = True
     """Default nullability when not specified."""
-
+    # 高精度数值 DECIMAL 未显式指定精度（Precision）时的默认值（如某些方言默认 38 或 18）。
     default_decimal_precision: int | None = None
     """Default decimal precision when not specified."""
-
+    # 高精度数值 DECIMAL 未显式指定标度（Scale）时的默认值（如 0 或 2）。
     default_decimal_scale: int | None = None
     """Default decimal scale when not specified."""
-
+    # 时间类型（如 Timestamp）未显式指定亚秒精度（毫秒/微秒/纳秒等）时的默认 scale 值。
     default_temporal_scale: int | None = None
     """Default temporal scale when not specified."""
-
+    # 时间间隔 Interval 未指定单位时的默认精度/单位（如 "s"、"D"）。
     default_interval_precision: str | None = None
     """Default interval precision when not specified."""
-
+    # 无法通过常规 Sqlglot 规则解析的自定义/特殊 SQL 类型字符串到 Ibis 类型的配置映射表，用于硬编码兜底。
     unknown_type_strings: dict[str, dt.DataType] = {}
     """String to ibis datatype mapping to use when converting unknown types."""
 
+    # 将 Sqlglot 的类型节点 sge.DataType 转换成 Ibis 的数据类型 dt.DataType。
+    # cls：类方法的接收者（即 SqlglotType 或其派生子类，如 DuckDB 特化的映射类）。通过 cls 可以访问定义在类上的配置属性（如 cls.default_nullable）以及特定类型的解析方法（如 cls._from_sqlglot_VARCHAR）。
+    # typ: sge.DataType：必选参数。输入的 Sqlglot 抽象语法树（AST）类型节点，代表由 Sqlglot 解析出来的 SQL 类型（例如表示 ARRAY<INT> 或 VARCHAR(255) 的对象）。
+    # nullable: bool | None = None：可选参数。指定转换后的 Ibis 数据类型是否可空（True 表示允许 NULL，False 表示不允许 NULL）。如果传入 None，则由内部的默认规则决定。
+    # -> dt.DataType：返回值类型。返回转换后的标准 Ibis 数据类型对象。
     @classmethod
     def to_ibis(cls, typ: sge.DataType, nullable: bool | None = None) -> dt.DataType:
         """Convert a sqlglot type to an ibis type."""
+        # 作用：获取 Sqlglot 类型节点 typ 内部最核心的标识符 this（例如 sge.DataType.Type.VARCHAR 或 sge.DataType.Type.ARRAY），赋值给 typecode 变量。
         typecode = typ.this
 
         # broken sqlglot thing
+        # 修复 Sqlglot 特定 AST 的兼容性逻辑
+        # 判断当前提取出的 typecode 是不是一个 sge.Interval 实例（即 Sqlglot 在某些场景误将 Interval 节点直接放在了 typ.this 字段上，而不是标准的类型枚举）。
+
         if isinstance(typecode, sge.Interval):
+            # 手动重新构造一个规范的 sge.DataType 节点。
             typ = sge.DataType(
                 this=sge.DataType.Type.INTERVAL,
                 expressions=[typecode.unit],
             )
+            # 更新 typecode，确保后续分支判定使用的是标准枚举。
             typecode = typ.this
-
+        # 优先查看 Sqlglot 节点 typ 内部的属性参数（typ.args）中是否显式标记了 "nullable"；
+        # 若 AST 中未显式包含 "nullable"，则使用函数参数传入的 nullable；
+        #若函数调用时也没有传入 nullable（即为 None），则读取当前类配置的默认值 cls.default_nullable（通常为 True）。
         nullable = typ.args.get(
             "nullable", nullable if nullable is not None else cls.default_nullable
         )
+        # 海象运算符（:=）与反射。尝试根据类型名称拼出内部处理函数名（例如 _from_sqlglot_VARCHAR 或 _from_sqlglot_ARRAY）。
+        # := 在 Python 中被称为 海象运算符（Walrus Operator） 允许你在表达式内部进行变量赋值，并同时返回这个赋值。
+        # 例如
+        # 一边读取 line，一边判断它是否为空字符串
+        # while line := file.readline():
+        #     print(line)
         if method := getattr(cls, f"_from_sqlglot_{typecode.name}", None):
+            # 如果类型是 ARRAY，提取元素类型和可能存在的长度/取值表达式。
             if typecode == sge.DataType.Type.ARRAY:
                 dtype = method(
                     *typ.expressions,
@@ -158,17 +188,23 @@ class SqlglotType(TypeMapper):
                     nullable=nullable,
                 )
             else:
+                # 对于其他实现了专属转换逻辑的类型（如 VARCHAR、MAP、STRUCT、DECIMAL 等），
+                # 将节点的参数表达式（*typ.expressions，如长度、精度、标度等）和 nullable
+                # 一起解包传给对应的 _from_sqlglot_* 方法，构造出对应的 Ibis 类型并赋值给 dtype。
                 dtype = method(*typ.expressions, nullable=nullable)
+        #如果类型不需要复杂的参数解析（例如普通的 INT、BIGINT、DOUBLE、BOOLEAN 等基础数据类型）：
+        # 在映射字典 _from_sqlglot_types 中查找该 typecode 对应的 Ibis 类型构造器（如 dt.Int64）。
         elif (known_typ := _from_sqlglot_types.get(typecode)) is not None:
             dtype = known_typ(nullable=nullable)
         else:
+            # 未知或不支持类型的兜底处理
             dtype = dt.Unknown(raw_type=typ)
 
         if nullable is not None:
             return dtype.copy(nullable=nullable)
         else:
             return dtype
-
+    # 将 Ibis 的 dt.DataType 反向转换为 Sqlglot 的 sge.DataType 节点。
     @classmethod
     def from_ibis(cls, dtype: dt.DataType) -> sge.DataType:
         """Convert an Ibis dtype to an sqlglot dtype."""
@@ -177,15 +213,17 @@ class SqlglotType(TypeMapper):
             return method(dtype)
         else:
             return sge.DataType(this=_to_sqlglot_types[type(dtype)])
-
+    # 将 SQL DDL 字符串（如 "VARCHAR(255)" 或 "TIMESTAMP WITH TIME ZONE"）直接解析为 Ibis 的 dt.DataType。
     @classmethod
     def from_string(cls, text: str, nullable: bool | None = None) -> dt.DataType:
+        # 首先查 unknown_type_strings 匹配；
         if dtype := cls.unknown_type_strings.get(text.lower()):
             return dtype
 
         if nullable is None:
             nullable = cls.default_nullable
-
+        # 若未命中，通过 sg.parse_one 在指定 dialect 下将字符串转换为 Sqlglot 节点，
+        # 解析失败时降级为 USERDEFINED 类型，最终交由 to_ibis 转化。
         try:
             sgtype = sg.parse_one(text, into=sge.DataType, read=cls.dialect)
         except sg.errors.ParseError:
@@ -194,6 +232,7 @@ class SqlglotType(TypeMapper):
             sgtype = sge.DataType(this=typecode.USERDEFINED, kind=text)
         return cls.to_ibis(sgtype, nullable=nullable)
 
+    # 将 Ibis 类型对象转换为符合当前方言（cls.dialect）规范的 SQL 语法字符串。
     @classmethod
     def to_string(cls, dtype: dt.DataType) -> str:
         return cls.from_ibis(dtype).sql(dialect=cls.dialect)

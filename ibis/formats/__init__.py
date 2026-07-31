@@ -17,10 +17,20 @@ C = TypeVar("C")
 T = TypeVar("T")
 S = TypeVar("S")
 
-
+# TypeMapper[T] 类的核心作用包括：
+# 类型双向桥接（Type Bridging）：
+# 在 Ibis 标准类型（dt.DataType） 和 特定后端/库的原生类型对象 T（如 pyarrow.DataType、duckdb.typing.DuckDBPyType 或 SQL/C 类型对象）之间进行双向转换。
+# 字符串与类型映射（SQL/Schema String Parsing）：
+# 将后端特定的类型字符串（如数据库导出的 "VARCHAR(255)"、"TIMESTAMP WITH TIME ZONE" 等）解析为 Ibis 的 DataType，或者反向输出为符合目标后端语法的类型字符串。
+# 标准化规范与接口契约（Interface Contract）：
+# 作为泛型抽象基类（Generic[T]），它定义了所有后端类型映射器必须遵循的标准 API 接口，保证了不同后端实现在框架内部调用方式的高度统一。
+# 1. 泛型类型属性：T 继承自 Python typing.Generic[T]。这里的 T 代表特定后端/数据格式原生的类型对象（Format-specific Type Object）。
 class TypeMapper(Generic[T]):
     # `T` is the format-specific type object, e.g. pyarrow.DataType
 
+    # 将 Ibis 统一的标准类型对象 dtype 转换为目标后端专用的原生类型对象 T。
+    # dtype (DataType): 需要转换的 Ibis 标准数据类型（例如 dt.string、dt.int64）。
+    # T: 转换后目标后端特定的原生类型对象。
     @classmethod
     def from_ibis(cls, dtype: DataType) -> T:
         """Convert an Ibis DataType to a format-specific type object.
@@ -37,6 +47,11 @@ class TypeMapper(Generic[T]):
         """
         raise NotImplementedError
 
+    # 基本作用：将目标后端原生的类型对象 typ 反向转换为 Ibis 标准的 DataType 对象。
+    # typ (T): 待转换的目标后端原生类型对象（例如 pa.int64()）。
+    # nullable (bool，默认值为 True): 指定生成的 Ibis DataType 是否允许包含空值（NULL）。
+    # DataType: 转换后的 Ibis 标准数据类型对象。
+    # 当从后端（如 DuckDB、Polars 或 Arrow 表）读取数据表 Schema 时，Ibis 调用此方法将后端的原生类型映射回统一的 Ibis 类型，供用户编写跨平台代码。
     @classmethod
     def to_ibis(cls, typ: T, nullable: bool = True) -> DataType:
         """Convert a format-specific type object to an Ibis DataType.
@@ -54,7 +69,10 @@ class TypeMapper(Generic[T]):
 
         """
         raise NotImplementedError
-
+    # 解析特定后端导出的文本/字符串形式的数据类型表示，将其转换为 Ibis 的 DataType。
+    # text (str): 目标数据库/后端特有的类型描述文本（例如 "VARCHAR(255)"、"TIMESTAMP_NTZ"）。
+    # nullable (bool，默认值为 True): 生成的 Ibis DataType 是否标记为可空。
+    # 用于解析数据库 DDL、返回的元数据（如 JDBC/ODBC 驱动返回的类型名称字段）或用户输入的后端专属类型名称。
     @classmethod
     def from_string(cls, text: str, nullable: bool = True) -> DataType:
         """Convert a backend-specific string representation into an Ibis DataType.
@@ -73,6 +91,9 @@ class TypeMapper(Generic[T]):
         """
         raise NotImplementedError
 
+    # 将 Ibis 的 DataType 转换为目标后端 SQL/DDL 或语法中可用的类型文本字符串。
+    # dtype (DataType): 需要转换的 Ibis 标准数据类型。
+    # str: 符合目标后端语法规范的类型描述字符串（例如 PostgreSQL 的 "text" 或 Snowflake 的 "NUMBER(38, 0)"）。
     @classmethod
     def to_string(cls, dtype: DataType) -> str:
         """Convert `dtype` into a backend-specific string representation.

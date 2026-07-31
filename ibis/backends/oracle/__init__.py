@@ -541,29 +541,36 @@ class Backend(
                 cur.executemany(
                     insert_stmt, list(data.iloc[start:end].itertuples(index=False))
                 )
-
+    # 核心目的在于：给定一段任意的 SQL 查询语句或表名（query），在不真正拉取全量数据的前提下，推导并返回该查询结果集所对应的 Ibis Schema（列名与数据类型的映射结构）。
+    # 由于 Oracle 数据库的元数据查询机制较为特殊，这个方法巧妙地采用了 “创建临时视图 $\rightarrow$ 查询 Oracle 系统元数据表（all_tab_columns） $\rightarrow$ 强制删除视图” 的黑盒技巧来安全地推导类型。
+    # query: str：输入的 SQL 查询字符串或表名。代表需要分析 Schema 的目标。
     def _get_schema_using_query(self, query: str) -> sch.Schema:
+        # 生成一个全局唯一的随机名称（例如 "oracle_metadata_a1b2c3"），作为接下来在 Oracle 中临时创建的视图（View）名称，防止并发冲突或表名覆盖。
         name = util.gen_name("oracle_metadata")
+        # 获取当前的 SQLGlot 方言名称（此处即为 "oracle"），用于后续 SQL 解析和重新生成。
         dialect = self.name
-
+        # 首先尝试将 query 识别为一个单纯的表名（sg.exp.Table）。
         try:
             sg_expr = sg.parse_one(query, into=sg.exp.Table, dialect=dialect)
+        # except sg.ParseError:：如果解析失败（说明不是纯表名，而是一段复杂的 SQL SELECT 语句），则降级按标准 SQL 表达式进行解析。
         except sg.ParseError:
             sg_expr = sg.parse_one(query, dialect=dialect)
 
         # If query is a table, adjust the query accordingly
+        # 如果确定传入的仅是一个表名，则将其改写扩展为标准的 SQL 查询表达式 SELECT * FROM <table_name>。
         if isinstance(sg_expr, sg.exp.Table):
             sg_expr = sg.select(STAR).from_(sg_expr)
 
         # TODO(gforsyth): followup -- this should probably be made a default
         # transform for quoting backends
+        # 定义一个 AST（语法树）转换器函数。遍历 SQL 语法树上的节点，如果是表名节点（Table）或列名节点（Column），通过 quoted=True 显式强制加上双引号（"）。
         def transformer(node):
             if isinstance(node, sg.exp.Table):
                 return sg.table(node.name, quoted=True)
             elif isinstance(node, sg.exp.Column):
                 return sg.column(col=node.name, quoted=True)
             return node
-
+        # 背景说明：Oracle 数据库对未加引号的标识符默认大写，强行加上双引号可以保持大小写敏感性，避免表名/列名因拼写导致无法识别。
         sg_expr = sg_expr.transform(transformer)
 
         this = sg.table(name, quoted=True)

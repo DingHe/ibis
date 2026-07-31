@@ -535,8 +535,16 @@ class DuckDBCompiler(SQLGlotCompiler):
         """DuckDB current timestamp defaults to timestamp + tz."""
         return self.cast(super().visit_TimestampNow(op), dt.timestamp)
 
+    # op Ibis 的底层操作节点（Operation Node），代表 First 或 Last 表达式节点本身。
+    # * 标志着之后的参数必须通过关键字名称传递。
+    # arg 已经被编译为 SQLGlot AST 的目标表达式/字段（即你要取首/尾值的那个列）。
+    # where 已经被编译为 SQLGlot AST 的过滤条件（即 FILTER (WHERE ...) 子句中的条件）。若无过滤条件则为 None。
+    # include_null 布尔标记。表示是否包含 NULL 值。如果为 False，则表示在获取首/尾值时需要忽略/过滤掉 NULL。
     def visit_First(self, op, *, arg, where, order_by, include_null):
+        # 检查 include_null 参数是否为 False（即要求忽略 NULL 值）
         if not include_null:
+            # sg.not_(NULL, copy=False)：生成 SQLGlot 的 NOT NULL 表达式。copy=False 避免不必要的节点深拷贝以提高编译性能。
+            # arg.is_(...)：将目标字段 arg 与 NOT NULL 用 IS 操作符连接，生成类似 arg IS NOT NULL 的语法树节点并赋值给变量 cond。
             cond = arg.is_(sg.not_(NULL, copy=False))
             where = cond if where is None else sge.And(this=cond, expression=where)
         return self.agg.first(arg, where=where, order_by=order_by)

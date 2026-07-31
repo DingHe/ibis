@@ -312,6 +312,12 @@ class Slotted(Abstract, metaclass=SlottedMeta):
         for name in self.__fields__:
             yield name, getattr(self, name)
 
+# FrozenSlotted 是 Ibis 底层结构演进的关键一步：它将轻量级的数据容器升级为了“不可变（Immutable）”且“可哈希（Hashable）”的数据结构。
+# FrozenSlotted 是 Ibis 中用于创建不可变轻量级数据类（Immutable Dataclass）的基类。
+# 不可变性（Immutability）与只读保障：它是 ibis.common.grounds.Concrete 的极简替代品。继承该类的对象在创建后不可被修改，非常适合用来表示 Ibis IR（中间表示）语法树中的节点或不可变配置。
+# 普通 Python 对象在作为 dict 的键或存入 set 时，每次调用 hash() 都会重新计算哈希值。
+# FrozenSlotted 在对象初始化阶段（__init__）或反序列化阶段（__setstate__）就将哈希值计算好并保存在 __precomputed_hash__ 属性中。
+# 后续调用 hash(obj) 时直接返回缓存的整数，将哈希开销降低到 $O(1)$ 的内存读取，这对于频繁进行节点查找、对比和重写的计算引擎（如 Ibis）能带来显著的性能提升。
 
 class FrozenSlotted(Slotted, Immutable, Hashable):
     """A lightweight alternative to `ibis.common.grounds.Concrete`.
@@ -319,9 +325,11 @@ class FrozenSlotted(Slotted, Immutable, Hashable):
     This class is used to create immutable dataclasses with slots and a precomputed
     hash value for quicker dictionary lookups.
     """
-
+    # 为当前类分配固定的底层内存槽位，用于存储预计算的哈希值。
     __slots__ = ("__precomputed_hash__",)
+    # 初始化当前类的字段清单。
     __fields__ = ()
+    # 用于记录当前实例预计算好的哈希值。
     __precomputed_hash__: int
 
     def __init__(self, **kwargs) -> None:
@@ -331,7 +339,7 @@ class FrozenSlotted(Slotted, Immutable, Hashable):
             object.__setattr__(self, field, value)
         hashvalue = hash((self.__class__, tuple(values)))
         object.__setattr__(self, "__precomputed_hash__", hashvalue)
-
+    # 在对象被 pickle 反序列化（或深拷贝）恢复时，还原所有属性值，并重新计算并缓存哈希值。
     def __setstate__(self, state):
         for name, value in state.items():
             object.__setattr__(self, name, value)

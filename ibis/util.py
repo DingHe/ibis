@@ -563,6 +563,12 @@ def slice_to_limit_offset(
             limit = ibis.greatest((stop - start) - count, 0)
     return limit, offset
 
+# 在 Ibis 项目的模式匹配系统中，如果我们需要为某个模块（例如 ibis.expr.operations）中的几十种不同的类型或节点创建对应的匹配模式（如 InstanceOf(Table)、InstanceOf(Value) 等），
+# 手动挨个实例化会产生大量的样板代码（Boilerplate）。
+# Namespace 是一个模式构造辅助工具类（Helper/Factory Class）。
+# 通过代理（Proxy）指定 Python 模块的属性访问，自动将模块中的类型或对象封装为给定的模式对象，从而大幅简化批量创建模式的代码。
+# 减少样板代码：允许开发者通过类似 ns.SomeClass 的属性访问语法，动态获取并生成针对 SomeClass 的模式（Pattern）对象，而无需写 PatternFactory(module.SomeClass)。
+# 延迟与动态查找：基于 Python 的动态属性查找机制，只有在实际访问 ns.SomeClass 时才会去查找模块并调用工厂函数构建模式
 
 class Namespace:
     """Convenience class for creating patterns for various types from a module.
@@ -578,14 +584,21 @@ class Namespace:
         The module object or name to look up the types.
 
     """
-
+    # 为当前类分配固定的内存槽位，仅允许存储 _factory 和 _module 两个私有属性。
     __slots__ = ("_factory", "_module")
+    # 存储用来构建模式的工厂函数。
+    # 当通过 Namespace 获取模块属性时，该工厂函数会被调用，接收从模块中查找出的对象，
+    # 并返回包装后的模式对象（例如 InstanceOf 类的构造函数）。
     _factory: Callable
+    # 存储绑定的目标 Python 模块。
     _module: ModuleType
-
+    # factory：工厂函数，接收一个来自模块的对象并返回对应的模式。
+    # module：可以是实际的 Python 模块对象（ModuleType），也可以是模块的名称字符串（如 "ibis.expr.operations"）。
     def __init__(self, factory, module):
+        # 判断 module 是否为字符串。如果是字符串名称，则直接从当前 Python 进程已加载的模块字典 sys.modules 中取出对应的模块对象。
         if isinstance(module, str):
             module = sys.modules[module]
+        # 将解析好的 module 赋值给私有属性 self._module，将传入的 factory 赋值给 self._factory。
         self._module = module
         self._factory = factory
 

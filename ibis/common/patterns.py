@@ -355,7 +355,10 @@ class Pattern(Hashable):
     def __iter__(self) -> SomeOf:
         yield SomeOf(self)
 
-
+# 既继承了 Slotted 的轻量级属性管理能力，又继承了 Pattern 的模式匹配能力。
+# 基于 Python 的身份标识符（Identity，即 is 运算符 / 内存地址）来进行严格的模式匹配。
+# 精确匹配单例与特定实例：当你在重写 IR 树或校验节点时，如果需要确保传入的对象与某个特定参考值（Reference Value）在内存中是同一个对象（例如匹配特定单例对象 None、True、False 或特定的 IR 实例），就可以使用 Is(ref_value)。
+# 比 ==（值相等）更严格：Is 校验的是 value is self.value，而不是 value == self.value。这意味着即使两个对象的值相等（例如两个不同的空列表 []），只要它们内存地址不同，Is 就会判定匹配失败。
 class Is(Slotted, Pattern):
     """Pattern that matches a value against a reference value.
 
@@ -365,10 +368,12 @@ class Is(Slotted, Pattern):
         The reference value to match against.
 
     """
-
+    # 为当前类分配固定的内存槽位，专门用于存储参考值 value。
     __slots__ = ("value",)
+    # 存储用于进行匹配的基准参考对象（Reference Value）
     value: AnyType
-
+    # 执行真正的身份匹配逻辑。校验传入的待匹配对象 value 是否与预设的参考对象 self.value 为同一对象。
+    # value：待进行匹配校验的输入值或 IR 节点对象。
     def match(self, value, context):
         if value is self.value:
             return value
@@ -425,7 +430,10 @@ class Capture(Slotted, Pattern):
         context[self.key] = value
         return value
 
-
+# Replace 是 Ibis 模式匹配与语法树（IR）重写系统中的核心转换模式类。
+# 当给定的值（value）匹配指定的模式（matcher）时，将其替换为计算得出或解析出的新值（通过 replacer 计算）。
+# 实现“匹配 -> 提取 -> 替换”闭环：它将“判断与匹配（Matching）”和“构造与替换（Replacement）”组合在了一起。
+# 支持延迟计算与上下文引用：在替换时，它会自动把匹配到的原始值存储到 context["_"]（保留变量 _）中，使 replacer 可以根据上下文捕获到的变量或原始值，动态计算并生成替换后的对象。
 class Replace(Slotted, Pattern):
     """Pattern that replaces a value with the output of another pattern.
 
@@ -437,9 +445,12 @@ class Replace(Slotted, Pattern):
         The deferred to use as a replacement.
 
     """
-
+    # 为当前类分配固定的内存槽位，用于存储匹配器（matcher）和替换器（replacer）。
     __slots__ = ("matcher", "replacer")
+    # 存储具体的匹配模式（Pattern 对象）。
     matcher: Pattern
+    # 存储替换逻辑解析器（Resolver / Deferred 对象）。
+    # 当 matcher 匹配成功后，通过调用该对象的 resolve(context) 方法动态生成并返回替换后的目标新对象。
     replacer: Resolver
 
     def __init__(self, matcher, replacer):
@@ -454,7 +465,12 @@ class Replace(Slotted, Pattern):
         context["_"] = value
         return self.replacer.resolve(context)
 
-
+# replace 函数是一个高阶函数（即返回函数的函数），用作 Python 装饰器（Decorator）。
+# 通过闭包机制，将一个普通函数包装为 Replace 模式对象。
+# 参数 matcher：用于匹配的模式或类型（例如 ns.Table 或某个 Pattern 实例）。它会被传递给底层的 Replace 类。
+# 内层闭包函数 decorator(replacer)
+# 参数 replacer：被该装饰器修饰的函数（即实际执行替换计算的逻辑体）。
+# 核心逻辑：调用 Replace(matcher, replacer)，利用此前分析过的 Replace 类的构造函数（自动将 replacer 包装为 Resolver），生成一个完整的 Replace 模式实例并返回。
 def replace(matcher):
     """More convenient syntax for replacing a value with the output of a function."""
 

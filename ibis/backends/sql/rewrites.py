@@ -108,13 +108,13 @@ class LastValue(ops.Analytic):
 # Project, Filter, Sort, etc. incrementally into the Select node. This way we
 # can have tighter control over simplification logic.
 
-
+# 将高层的 Project（投影/选列算子）转换为 Select 节点，将投影列放入 selections。
 @replace(p.Project)
 def project_to_select(_, **kwargs):
     """Convert a Project node to a Select node."""
     return Select(_.parent, selections=_.values)
 
-
+# 将过滤条件分类。如果条件中包含 WindowFunction，则划分为 qualified（需要 QUALIFY 处理）；否则划分为 predicates（普通 WHERE）。
 def partition_predicates(predicates):
     qualified = []
     unqualified = []
@@ -127,7 +127,7 @@ def partition_predicates(predicates):
 
     return unqualified, qualified
 
-
+# 将 Filter 算子转换为 Select 节点，并调用 partition_predicates 拆分普通条件与窗口条件。
 @replace(p.Filter)
 def filter_to_select(_, **kwargs):
     """Convert a Filter node to a Select node."""
@@ -136,19 +136,19 @@ def filter_to_select(_, **kwargs):
         _.parent, selections=_.values, predicates=predicates, qualified=qualified
     )
 
-
+# 将 Sort 算子转换为带有 sort_keys 属性的 Select 节点。
 @replace(p.Sort)
 def sort_to_select(_, **kwargs):
     """Convert a Sort node to a Select node."""
     return Select(_.parent, selections=_.values, sort_keys=_.keys)
 
-
+# 将 Distinct 算子转换为 distinct=True 的 Select 节点。
 @replace(p.Distinct)
 def distinct_to_select(_, **kwargs):
     """Convert a Distinct node to a Select node."""
     return Select(_.parent, selections=_.values, distinct=True)
 
-
+# 优化列删除操作。如果删除的列少于总列数的 50%，保持原样以生成更简短的代码；否则转换为列清单明确的 Select 节点。
 @replace(p.DropColumns)
 def drop_columns_to_select(_, **kwargs):
     """Convert a DropColumns node to a Select node."""
@@ -159,7 +159,7 @@ def drop_columns_to_select(_, **kwargs):
         return _
     return Select(_.parent, selections=_.values)
 
-
+# 将 FillNull（填充空值）重写为 Select 节点。利用 ops.Coalesce(col, replacement) 替代空值。
 @replace(p.FillNull)
 def fill_null_to_select(_, **kwargs):
     """Rewrite FillNull to a Select node."""
@@ -184,7 +184,7 @@ def fill_null_to_select(_, **kwargs):
 
     return Select(_.parent, selections=selections)
 
-
+# 将 DropNull（删除含空值的行）重写为带有 ops.NotNull 和 And/Or 过滤条件的 Select 节点。
 @replace(p.DropNull)
 def drop_null_to_select(_, **kwargs):
     """Rewrite DropNull to a Select node."""
@@ -207,7 +207,9 @@ def drop_null_to_select(_, **kwargs):
 
     return Select(_.parent, selections=_.values, predicates=tuple(preds))
 
-
+# 将窗口函数中的 First 或 Last 聚合算子重写为窗口特有的 FirstValue / LastValue 节点。若带有 unsupported 的 where 子句则抛出异常。
+# 根据 @replace 的机制，_ 代表当前被匹配到的 WindowFunction 节点对象本身。
+# 结构：该对象通常包含 _.func（内部的聚合函数，如 First 或 Last）以及窗口定义（如 frame、group_by 等）。
 @replace(p.WindowFunction(p.First | p.Last))
 def first_to_firstvalue(_, **kwargs):
     """Convert a First or Last node to a FirstValue or LastValue node."""

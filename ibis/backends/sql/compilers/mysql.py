@@ -252,12 +252,25 @@ class MySQLCompiler(SQLGlotCompiler):
             ),
             NULL,
         )
-
+    # self：当前编译器对象（MySQLCompiler 的实例），用于访问父类方法或编译器的全局状态。
+    # op：Ibis 的底层 IR（中间表示）节点对象，代表相等的二元操作符 Equals(left, right)。它可以访问原始未编译的节点信息（如 op.left.dtype）。
+    # left：经过编译器转换/渲染后的左操作数的 Sqlglot 表达式（例如 sge.Column(...)）。
+    # right：经过编译器转换/渲染后的右操作数的 Sqlglot 表达式（例如 sge.Literal(...)）。
     def visit_Equals(self, op, *, left, right):
+        # 检查 Ibis IR 节点中左侧表达式 op.left 的数据类型 dtype 是否为字符串类型（如 dt.String）。
         if op.left.dtype.is_string():
+            # 断言/校验右侧表达式 op.right 的类型也必须是字符串类型。
+            # 如果右侧不是字符串（例如类型推导不一致），程序会直接抛出 AssertionError，并将实际的 op.right.dtype 作为错误提示打印出来，确保类型一致性。
             assert op.right.dtype.is_string(), op.right.dtype
+            # 构建一个代表 BINARY 数据类型的 Sqlglot 抽象语法树节点。
+            # 背景：在 MySQL 中，默认的字符集排序规则（Collation，如 utf8mb4_general_ci）是不区分大小写的（ci 代表 case-insensitive）。
+            # 为了在 Ibis 中实现严格的区分大小写比较（符合 Python / 绝大多数 SQL 引擎的语义），
+            # 需要将其中一个字符串转为二进制字节流 BINARY（如 BINARY 'abc' 或 CAST(col AS BINARY)），这样 MySQL 就会按字节进行精确比较。
             to = sge.DataType(this=sge.DataType.Type.BINARY)
+            # 构造并返回一个新的 Sqlglot AST 比较节点。
             return sge.Cast(this=left, to=to).eq(right)
+        # 如果比较的双方不是字符串（比如数值、日期、布尔值的比较），
+        # 则直接调用父类（通常是通用的 SQLCompiler）的 visit_Equals 默认逻辑进行处理，直接生成标准的 left = right SQL 表达式。
         return super().visit_Equals(op, left=left, right=right)
 
     def visit_StringContains(self, op, *, haystack, needle):
